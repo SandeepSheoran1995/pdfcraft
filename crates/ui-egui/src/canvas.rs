@@ -3509,7 +3509,12 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                         let el = crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone());
                         view.canvas_selection.select_element(el, shift);
                     } else if !shift && view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == i) {
-                        view.canvas_selection.clear();
+                        let near_selection = view.canvas_selection.selected.as_ref().is_some_and(|s| {
+                            s.screen_rect(&xf, info).expand(8.0).contains(p)
+                        });
+                        if !near_selection {
+                            view.canvas_selection.clear();
+                        }
                     }
                 } else if !view.canvas_selection.has_selection() {
                     if let Some((idx, block)) =
@@ -3527,7 +3532,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 (matches!(tool, QuickTool::Select | QuickTool::Fill(_)) && !comments_hidden).then_some(view.comments.selected).flatten();
             view.signature_drag.prepare(ui.ctx(), doc, preview_target, scale);
             view.signature_drag.paint(painter, &pcx, &view.comments, view.pending_edit.as_ref());
-            crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(painter, i, &xf, info, &view.canvas_selection);
+            if let Some(edit) =
+                crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(ui, painter, i, &xf, info, &mut view.canvas_selection)
+            {
+                view.pending_edit = Some(edit);
+            }
 
             // Text layer: find matches, selection, I-beam and drag-to-select.
             let to_screen = |g: [f32; 4]| xf.view_rect(g);

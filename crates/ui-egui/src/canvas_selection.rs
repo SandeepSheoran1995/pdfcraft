@@ -123,6 +123,63 @@ impl SelectionHandle {
         }
         bounds.contains(pos).then_some(Self::Move)
     }
+
+    /// Calculate the resized bounding rectangle given a handle drag delta.
+    pub fn resize_rect(self, rect: Rect, delta: egui::Vec2) -> Rect {
+        let mut min = rect.min;
+        let mut max = rect.max;
+        match self {
+            Self::TopLeft => {
+                min.x += delta.x;
+                min.y += delta.y;
+            }
+            Self::TopRight => {
+                max.x += delta.x;
+                min.y += delta.y;
+            }
+            Self::BottomLeft => {
+                min.x += delta.x;
+                max.y += delta.y;
+            }
+            Self::BottomRight => {
+                max.x += delta.x;
+                max.y += delta.y;
+            }
+            Self::Top => {
+                min.y += delta.y;
+            }
+            Self::Bottom => {
+                max.y += delta.y;
+            }
+            Self::Left => {
+                min.x += delta.x;
+            }
+            Self::Right => {
+                max.x += delta.x;
+            }
+            Self::Move => {
+                min += delta;
+                max += delta;
+            }
+        }
+        // Enforce minimum dimensions of 10 points and prevent rectangle inversion
+        const MIN_SIZE: f32 = 10.0;
+        if min.x > max.x - MIN_SIZE {
+            if matches!(self, Self::TopLeft | Self::BottomLeft | Self::Left) {
+                min.x = max.x - MIN_SIZE;
+            } else {
+                max.x = min.x + MIN_SIZE;
+            }
+        }
+        if min.y > max.y - MIN_SIZE {
+            if matches!(self, Self::TopLeft | Self::TopRight | Self::Top) {
+                min.y = max.y - MIN_SIZE;
+            } else {
+                max.y = min.y + MIN_SIZE;
+            }
+        }
+        Rect::from_min_max(min, max)
+    }
 }
 
 /// Captured text formatting for the Format Painter.
@@ -217,10 +274,18 @@ impl SelectionLayoutEngine {
         }
     }
 
-    /// Render visual bounding box and selection handles for selected and hovered elements.
-    pub fn paint_selection_overlay(painter: &egui::Painter, page: usize, xf: &PageXform, info: &DocInfo, state: &SelectionState) {
+    /// Render visual bounding box and selection handles for selected and hovered elements,
+    /// wiring interactive resize dragging across all eight handles.
+    pub fn paint_selection_overlay(
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        page: usize,
+        xf: &PageXform,
+        info: &DocInfo,
+        state: &mut SelectionState,
+    ) -> Option<Edit> {
         if page >= info.pages.len() {
-            return;
+            return None;
         }
         // Paint subtle hover outline if hovered element is distinct from selected.
         if let Some(hovered) = &state.hovered {
@@ -237,23 +302,97 @@ impl SelectionLayoutEngine {
             painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.25, ACCENT_BLUE.gamma_multiply(0.7)), egui::StrokeKind::Outside);
         }
 
-        // Paint primary selected element bounding box with 8 handles.
-        if let Some(sel) = &state.selected {
+        let mut pending_edit = None;
+
+        // Paint primary selected element bounding box with 8 handles and wire dragging interactions.
+        if let Some(sel) = &mut state.selected {
             if sel.page != page {
-                return;
+                return None;
             }
             let rect = sel.screen_rect(xf, info).expand(2.0);
+            let handle_size = 7.0;
+            let mut handle_dragged = None;
+            let mut drag_stopped = false;
+
+            for (handle_idx, (handle, h_rect)) in SelectionHandle::handle_rects(rect, handle_size).into_iter().enumerate() {
+                let handle_id = ui.id().with(("handle", sel.index, handle_idx));
+                let resp = ui.interact(h_rect.expand(2.5), handle_id, egui::Sense::drag());
+
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(handle.cursor_icon());
+                }
+
+                if resp.dragged() {
+                    let delta = resp.drag_delta();
+                    if delta != egui::Vec2::ZERO {
+                        handle_dragged = Some((handle, delta));
+                    }
+                }
+
+                if resp.drag_stopped() {
+                    drag_stopped = true;
+                }
+            }
+
+            let active_rect = if let Some((handle, delta)) = handle_dragged {
+                let new_screen_rect = handle.resize_rect(rect, delta);
+                if let Some(p) = info.pages.get(page) {
+                    let (a, b) = (xf.screen_to_view(new_screen_rect.min), xf.screen_to_view(new_screen_rect.max));
+                    let (u, v) = (p.view_to_user(a.0, a.1), p.view_to_user(b.0, b.1));
+                    sel.user_rect = [u[0].min(v[0]) as f64, u[1].min(v[1]) as f64, u[0].max(v[0]) as f64, u[1].max(v[1]) as f64];
+                }
+                state.active_handle = Some(handle);
+                ui.ctx().request_repaint();
+                new_screen_rect
+            } else {
+                rect
+            };
+
             // Solid selection border
-            painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.5, ACCENT_BLUE), egui::StrokeKind::Outside);
+            painter.rect_stroke(active_rect, CornerRadius::same(2), Stroke::new(1.5, ACCENT_BLUE), egui::StrokeKind::Outside);
             // Light background tint
-            painter.rect_filled(rect, CornerRadius::same(2), ACCENT_BLUE.gamma_multiply(0.04));
+            painter.rect_filled(active_rect, CornerRadius::same(2), ACCENT_BLUE.gamma_multiply(0.04));
 
             // Handles (corners and edge midpoints)
-            let handle_size = 7.0;
-            for (_, h_rect) in SelectionHandle::handle_rects(rect, handle_size) {
+            for (_, h_rect) in SelectionHandle::handle_rects(active_rect, handle_size) {
                 painter.rect(h_rect, CornerRadius::same(1), Color32::WHITE, Stroke::new(1.0, ACCENT_BLUE), egui::StrokeKind::Middle);
             }
+
+            if drag_stopped {
+                match sel.kind {
+                    SelectableKind::TextBlock => {
+                        let new_w = (sel.user_rect[2] - sel.user_rect[0]).max(10.0);
+                        pending_edit = Some(Edit::EditTextBlock {
+                            page: sel.page,
+                            block: sel.index,
+                            text: sel.text.clone().unwrap_or_default(),
+                            style: pdfcraft_engine::BlockStyle {
+                                width: Some(new_w),
+                                ..Default::default()
+                            },
+                        });
+                    }
+                    SelectableKind::Image => {
+                        pending_edit = Some(Edit::EditPageImage {
+                            page: sel.page,
+                            index: sel.index,
+                            change: ImageEdit::Move(sel.user_rect),
+                        });
+                    }
+                    SelectableKind::TextLine => {
+                        pending_edit = Some(Edit::EditTextLine {
+                            page: sel.page,
+                            line: sel.index,
+                            text: sel.text.clone().unwrap_or_default(),
+                        });
+                    }
+                    SelectableKind::AddedContent => {}
+                }
+                state.active_handle = None;
+            }
         }
+
+        pending_edit
     }
 }
 
@@ -615,5 +754,28 @@ mod tests {
         let bounds_right = Rect::from_min_max(Pos2::new(950.0, 200.0), Pos2::new(990.0, 250.0));
         let anchor_right = FloatingContextMenu::compute_anchor(bounds_right, viewport, 180.0, 36.0).unwrap();
         assert!(anchor_right.x + 180.0 <= 1000.0 - 8.0);
+    }
+
+    #[test]
+    fn test_selection_handle_resize_rect() {
+        let rect = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(200.0, 200.0));
+
+        // Resizing TopLeft
+        let r_tl = SelectionHandle::TopLeft.resize_rect(rect, vec2(-10.0, -20.0));
+        assert_eq!(r_tl.min, Pos2::new(90.0, 80.0));
+        assert_eq!(r_tl.max, Pos2::new(200.0, 200.0));
+
+        // Resizing BottomRight
+        let r_br = SelectionHandle::BottomRight.resize_rect(rect, vec2(15.0, 25.0));
+        assert_eq!(r_br.min, Pos2::new(100.0, 100.0));
+        assert_eq!(r_br.max, Pos2::new(215.0, 225.0));
+
+        // Resizing Right
+        let r_r = SelectionHandle::Right.resize_rect(rect, vec2(50.0, 0.0));
+        assert_eq!(r_r.width(), 150.0);
+
+        // Clamping to MIN_SIZE
+        let r_clamped = SelectionHandle::Right.resize_rect(rect, vec2(-200.0, 0.0));
+        assert!(r_clamped.width() >= 10.0);
     }
 }
