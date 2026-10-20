@@ -57,7 +57,7 @@ pub use pdfcraft_create::{CONVERTIBLE, CreateError, ImageResolution, SourceKind,
 pub use pdfcraft_edit::added::{text_rect as added_text_rect, text_width as added_text_width};
 pub use pdfcraft_edit::{
     Added, AddedImage, AddedText, Align as TextAlign, Background, Content as AddedContent, Family as FontFamily, HeaderFooter, LineSegment,
-    MarkKind, Watermark, set_line_properties,
+    MarkKind, Watermark, set_line_properties, update_line_endpoints,
 };
 pub use pdfcraft_forms::{
     BorderStyle, CheckStyle, Field as FormField, FieldAction, FieldChange, FieldFont, FieldKind as FormFieldKind, FieldProps, FieldValue,
@@ -276,6 +276,8 @@ fn scope_of(edit: &Edit) -> Scope {
         // Page content, resources and added content/marks only: the page tree, annotations,
         // fields, links and document metadata are untouched (see `refresh_content`).
         Edit::MoveObjects { .. }
+        | Edit::UpdateLineEndpoints { .. }
+        | Edit::SetLineProperties { .. }
         | Edit::EditTextLine { .. }
         | Edit::EditTextBlock { .. }
         | Edit::EditPageImage { .. }
@@ -1607,6 +1609,21 @@ pub enum Edit {
         objects: Vec<ObjectTarget>,
         offset: [f64; 2],
     },
+    /// Update vector line segment endpoints on `page`.
+    UpdateLineEndpoints {
+        page: usize,
+        target: ObjectTarget,
+        new_start: [f64; 2],
+        new_end: [f64; 2],
+    },
+    /// Set vector line properties (stroke color, stroke width, dash pattern).
+    SetLineProperties {
+        page: usize,
+        target: ObjectTarget,
+        color: Option<[f64; 3]>,
+        width: Option<f64>,
+        dash: Option<Vec<f64>>,
+    },
     /// Edit text in a paragraph box: replace paragraph `block` (from `Document::text_blocks`),
     /// rewrapped to the box's width.
     EditTextBlock {
@@ -1909,6 +1926,8 @@ pub const EDIT_LABELS: &[&str] = &[
     "Load document font",
     "Move object",
     "Move objects",
+    "Edit line endpoints",
+    "Change line properties",
     "Move image",
     "Rotate image",
     "Flip image",
@@ -2040,6 +2059,8 @@ impl Edit {
             Edit::EditTextLine { .. } | Edit::EditTextBlock { .. } => Label::of("Edit text"),
             Edit::RegisterTextFont { .. } => Label::of("Load document font"),
             Edit::MoveObjects { objects, .. } => plural("Move object", "Move objects", objects.len()),
+            Edit::UpdateLineEndpoints { .. } => Label::of("Edit line endpoints"),
+            Edit::SetLineProperties { .. } => Label::of("Change line properties"),
             Edit::EditPageImage { change, .. } => Label::of(match change {
                 ImageEdit::Move(_) => "Move image",
                 ImageEdit::Rotate(_) => "Rotate image",
@@ -2201,6 +2222,8 @@ fn check_permission(edit: &Edit, p: &pdfcraft_cos::Permissions) -> Result<(), Ed
         | Edit::AddImage { .. }
         | Edit::UpdateContent { .. }
         | Edit::MoveObjects { .. }
+        | Edit::UpdateLineEndpoints { .. }
+        | Edit::SetLineProperties { .. }
         | Edit::DeleteContent { .. }
         | Edit::ReplaceImage { .. }
         | Edit::ClearRedactions
@@ -2570,6 +2593,12 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
             pdfcraft_edit::change_image(doc, *page, *index, &c)?;
         }
         Edit::MoveObjects { page, objects, offset } => pdfcraft_edit::move_objects(doc, *page, objects, *offset)?,
+        Edit::UpdateLineEndpoints { page, target, new_start, new_end } => {
+            pdfcraft_edit::update_line_endpoints(doc, *page, *target, *new_start, *new_end)?;
+        }
+        Edit::SetLineProperties { page, target, color, width, dash } => {
+            pdfcraft_edit::set_line_properties(doc, *page, *target, *color, *width, dash.clone())?;
+        }
         Edit::EditTextBlock { page, block, text, style } => {
             pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;
         }

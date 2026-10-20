@@ -145,14 +145,40 @@ fn get_downloads_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-fn safe_rect_and_pixels(rect: [f64; 4], pixel_size: [u32; 2], kind: pdfcraft_engine::barcode_scan::CodeKind) -> ([f64; 4], [f64; 4], u32, u32) {
+fn safe_rect_and_pixels(
+    rect: [f64; 4],
+    pixel_size: [u32; 2],
+    kind: pdfcraft_engine::barcode_scan::CodeKind,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+) -> ([f64; 4], [f64; 4], u32, u32) {
     let min_x = if rect[0].is_finite() && rect[2].is_finite() { rect[0].min(rect[2]) } else { 0.0 };
-    let max_x = if rect[0].is_finite() && rect[2].is_finite() { rect[0].max(rect[2]) } else { 100.0 };
+    let mut max_x = if rect[0].is_finite() && rect[2].is_finite() { rect[0].max(rect[2]) } else { 100.0 };
     let min_y = if rect[1].is_finite() && rect[3].is_finite() { rect[1].min(rect[3]) } else { 0.0 };
     let max_y = if rect[1].is_finite() && rect[3].is_finite() { rect[1].max(rect[3]) } else { 50.0 };
 
-    let orig_w = (max_x - min_x).max(15.0);
+    let mut orig_w = (max_x - min_x).max(15.0);
     let orig_h = (max_y - min_y).max(15.0);
+
+    let rect_w = orig_w.round().max(16.0) as u32;
+    let rect_h = orig_h.round().max(16.0) as u32;
+    let mut pw = if pixel_size[0] > 0 { pixel_size[0].max(16) } else { rect_w };
+    let ph = if pixel_size[1] > 0 { pixel_size[1].max(16) } else { rect_h };
+
+    // When payload increases on 1D barcodes (e.g. from 4 to 5 digits), keeping module width requires
+    // expanding to the right: anchor min_x and grow max_x and pixel width pw proportionally.
+    if kind != pdfcraft_engine::barcode_scan::CodeKind::QrCode
+        && let (Some(old_t), Some(new_t)) = (old_text, new_text)
+    {
+        let old_len = old_t.chars().count();
+        let new_len = new_t.chars().count();
+        if new_len > old_len && old_len > 0 {
+            let scale_x = (new_len as f64) / (old_len as f64);
+            orig_w = (orig_w * scale_x).max(orig_w);
+            max_x = min_x + orig_w;
+            pw = (pw as f64 * scale_x).round().max(pw as f64) as u32;
+        }
+    }
 
     // Exact normalized safe rect without inflation for re-embedding new code
     let new_image_rect = [min_x, min_y, max_x, max_y];
@@ -164,10 +190,6 @@ fn safe_rect_and_pixels(rect: [f64; 4], pixel_size: [u32; 2], kind: pdfcraft_eng
     let max_y = max_y + 3.0;
     let whiteout_rect = [min_x, min_y, max_x, max_y];
 
-    let rect_w = orig_w.round().max(16.0) as u32;
-    let rect_h = orig_h.round().max(16.0) as u32;
-    let pw = if pixel_size[0] > 0 { pixel_size[0].max(16) } else { rect_w };
-    let ph = if pixel_size[1] > 0 { pixel_size[1].max(16) } else { rect_h };
     let (pw, ph) = if kind == pdfcraft_engine::barcode_scan::CodeKind::QrCode {
         let side = pw.max(ph).max(64);
         (side, side)
@@ -383,9 +405,16 @@ impl BarcodeScannerHud {
         let hud_pos = Pos2::new((viewport.right() - hud_w - 18.0).max(viewport.left() + 18.0), viewport.top() + 18.0);
 
         if state.panel_open {
-            egui::Area::new(egui::Id::new(("barcode-scanner-hud-v3", view_id))).order(egui::Order::Foreground).fixed_pos(hud_pos).show(
-                ui.ctx(),
-                |ui| {
+            egui::Window::new("QR & Barcodes")
+                .id(egui::Id::new(("barcode-scanner-hud-window", view_id)))
+                .order(egui::Order::Foreground)
+                .default_pos(hud_pos)
+                .default_width(hud_w)
+                .resizable(true)
+                .collapsible(false)
+                .title_bar(false)
+                .frame(egui::Frame::NONE)
+                .show(ui.ctx(), |ui| {
                     egui::Frame::NONE
                         .fill(card_bg)
                         .stroke(border_stroke)
@@ -393,22 +422,13 @@ impl BarcodeScannerHud {
                         .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(170) })
                         .inner_margin(Margin::symmetric(14, 12))
                         .show(ui, |ui| {
-                            ui.set_width(hud_w - 28.0);
+                            ui.set_width((hud_w - 28.0).max(ui.available_width()));
 
-                            // Header: Icon + Title + Sandeep PDF Studio v3 Tag + Close button
+                            // Header: Icon + Title + Close button
                             ui.horizontal(|ui| {
                                 crate::icons::paint(ui, Rect::from_min_size(ui.cursor().min, vec2(16.0, 16.0)), "scan", 16.0, accent_blue);
                                 ui.add_space(22.0);
                                 ui.label(egui::RichText::new("QR & Barcodes").font(theme::semibold(13.5)).color(text_primary));
-
-                                // v3 Version Chip
-                                ui.painter().rect_filled(
-                                    Rect::from_min_size(ui.cursor().min + vec2(4.0, 2.0), vec2(26.0, 15.0)),
-                                    CornerRadius::same(4),
-                                    Color32::from_rgb(0x1D, 0x4E, 0xD8),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new("v3").font(theme::semibold(9.5)).color(Color32::WHITE));
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button("✕").on_hover_text("Close HUD").clicked() {
@@ -511,7 +531,7 @@ impl BarcodeScannerHud {
                                                 egui::RichText::new("EDIT PAYLOAD (100% RE-EMBED)").font(theme::semibold(9.5)).color(text_muted),
                                             );
                                             ui.add_space(3.0);
-                                            ui.add(egui::TextEdit::singleline(buf).desired_width(ui.available_width()));
+                                            ui.add(egui::TextEdit::multiline(buf).desired_width(ui.available_width()).desired_rows(3));
                                             ui.add_space(8.0);
                                             ui.horizontal(|ui| {
                                                 let can_apply = can_modify && !buf.trim().is_empty();
@@ -563,8 +583,9 @@ impl BarcodeScannerHud {
                             ui.collapsing("Generate New QR Code", |ui| {
                                 ui.add_space(4.0);
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut state.qr_input)
+                                    egui::TextEdit::multiline(&mut state.qr_input)
                                         .desired_width(ui.available_width())
+                                        .desired_rows(2)
                                         .hint_text("https://example.com or text..."),
                                 );
                                 ui.add_space(6.0);
@@ -600,7 +621,8 @@ impl BarcodeScannerHud {
             state.edit_buffer = Some(active.text.clone());
         }
         if let Some((active, buf)) = apply_code {
-            let (whiteout_rect, new_image_rect, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind);
+            let (whiteout_rect, new_image_rect, pw, ph) =
+                safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), Some(&buf));
             let (edit_whiteout, edit_image) =
                 (display_rect(whiteout_rect, Some(info), current_page), display_rect(new_image_rect, Some(info), current_page));
 
@@ -644,7 +666,7 @@ impl BarcodeScannerHud {
             }
         }
         if let Some(active) = delete_code {
-            let (whiteout_rect, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind);
+            let (whiteout_rect, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), None);
             let edit_whiteout = display_rect(whiteout_rect, Some(info), current_page);
             match Document::generate_whiteout(pw, ph) {
                 Ok(whiteout_png) => {
@@ -665,7 +687,7 @@ impl BarcodeScannerHud {
             }
         }
         if let Some(active) = download_code {
-            let (_, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind);
+            let (_, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), None);
             let pw = pw.max(128);
             let ph = if active.kind == pdfcraft_engine::barcode_scan::CodeKind::QrCode { pw } else { ph.max(48) };
             match Document::generate_replacement_code(active.kind, &active.text, pw, ph) {
@@ -839,5 +861,17 @@ mod tests {
         // active_index tracks target_rect and points to index 0 where Code 2 is now
         assert_eq!(state.active_index, 0);
         assert_eq!(state.active_code().map(|c| c.text.as_str()), Some("Code 2 Updated"));
+    }
+
+    #[test]
+    fn test_safe_rect_and_pixels_payload_expansion() {
+        let rect = [10.0, 20.0, 110.0, 50.0];
+        let pixel_size = [100, 30];
+        let (w_rect, img_rect, pw, _ph) =
+            safe_rect_and_pixels(rect, pixel_size, CodeKind::Code128, Some("1234"), Some("12345"));
+        assert_eq!(img_rect[0], 10.0, "left must stay anchored");
+        assert!(img_rect[2] > 110.0, "right must expand to accommodate 5th digit");
+        assert!(pw > 100, "pixel width must scale to keep module thickness");
+        assert!(w_rect[2] >= img_rect[2], "whiteout must cover expanded right edge");
     }
 }

@@ -589,6 +589,8 @@ pub struct DocView {
     pub(crate) move_background: crate::content_ui::MoveBackground,
     /// Edit text & images: the images per page (by document generation), and the selected one.
     pub(crate) edit_images: HashMap<usize, (u64, Vec<pdfcraft_engine::PageImage>)>,
+    /// Vector editing: the line segments per page (by document generation).
+    pub(crate) vector_lines: HashMap<usize, (u64, Vec<pdfcraft_engine::LineSegment>)>,
     pub(crate) objects: crate::object_ui::ObjectSelection,
     pub image_selection: Option<crate::edit_text_ui::ImageSelection>,
     /// Select tool: the picture clicked, to copy in its original format.
@@ -633,8 +635,8 @@ pub struct DocView {
     pub vector_edit_mode: bool,
     /// Local state for vector line property editing panel.
     pub line_properties: LinePropertiesState,
-    /// Active vector line endpoint drag: `(handle, new_endpoint_user_coord)`.
-    pub line_drag: Option<(crate::canvas_selection::SelectionHandle, [f64; 2])>,
+    /// Active vector line endpoint/move drag: `(handle, current_user_coord, start_user_coord)`.
+    pub line_drag: Option<(crate::canvas_selection::SelectionHandle, [f64; 2], [f64; 2])>,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
@@ -883,6 +885,7 @@ impl DocView {
             text_background: Default::default(),
             move_background: Default::default(),
             edit_images: HashMap::new(),
+            vector_lines: HashMap::new(),
             objects: Default::default(),
             image_selection: None,
             picked_image: None,
@@ -3119,7 +3122,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         let mut best_overlap = -1.0f32;
         let mut current_overlap = -1.0f32;
         let mut current_height = f32::INFINITY;
-        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let pointer = ui.input(|i| if i.pointer.any_down() { i.pointer.latest_pos() } else { i.pointer.hover_pos() });
         // A press on a page makes it the current one (as in Acrobat), so a page command with
         // no selection (Rotate, Delete) acts on the page the reader pointed at, not on a page
         // gone to earlier that still shows whole beside it.
@@ -3513,44 +3516,93 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             {
                 view.links.context = Some((i, l.index));
             }
-            let consumed = on_objects || on_edit_text || on_link || on_content || boxing || on_field || comments::page_input(ui, &resp, &pcx, view);
+            let consumed = (on_objects || on_edit_text || on_link || on_content || boxing || on_field || comments::page_input(ui, &resp, &pcx, view)) && view.line_drag.is_none();
             if tool == QuickTool::Select
-                && !consumed
-                && let Some(p) = pointer.filter(|p| xf.rect.contains(*p))
+                && (!consumed || view.line_drag.is_some())
+                && let Some(p) = pointer.filter(|p| xf.rect.contains(*p) || view.line_drag.is_some())
             {
                 let shift = ui.input(|inp| inp.modifiers.shift);
                 if view.vector_edit_mode {
-                    let page_lines = doc.editable_lines(i).unwrap_or_default();
-                    let mut endpoint_hit = None;
+                    let page_lines = if view.line_drag.is_some() {
+                        Vec::new()
+                    } else {
+                        let generation = doc.edit_generation();
+                        match view.vector_lines.get(&i) {
+                            Some((g, lines)) if *g == generation => lines.clone(),
+                            _ => {
+                                let lines = doc.editable_lines(i).unwrap_or_default();
+                                view.vector_lines.insert(i, (generation, lines.clone()));
+                                lines
+                            }
+                        }
+                    };
+                    let mut line_handle_hit = None;
                     if let Some(sel) = &view.canvas_selection.selected
                         && sel.page == i
                         && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
                         && view.canvas_selection.multi_selected.is_empty()
                         && let Some(line) = &sel.line
                     {
-                        endpoint_hit = crate::canvas_selection::hit_test_line_endpoint(line, p, &xf, info, 8.0);
+                        line_handle_hit = crate::canvas_selection::hit_test_line_endpoint(line, p, &xf, info, 8.0);
+                        if line_handle_hit.is_none() && crate::canvas_selection::hit_test_line(p, line, &xf, info, 8.0) {
+                            line_handle_hit = Some(crate::canvas_selection::SelectionHandle::Move);
+                        }
                     }
 
-                    if let Some(handle) = endpoint_hit {
+                    if let Some(handle) = line_handle_hit {
                         ui.ctx().set_cursor_icon(handle.cursor_icon());
                         if resp.drag_started() || (resp.clicked() && view.line_drag.is_none()) {
                             let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
-                            view.line_drag = Some((handle, user_p));
+                            view.line_drag = Some((handle, user_p, user_p));
                             view.canvas_selection.active_handle = Some(handle);
                         }
                     }
 
-                    if let Some((handle, _)) = view.line_drag {
+                    if let Some((handle, _, start_p)) = view.line_drag {
                         ui.ctx().set_cursor_icon(handle.cursor_icon());
                         if resp.dragged() {
                             let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
-                            view.line_drag = Some((handle, user_p));
+                            view.line_drag = Some((handle, user_p, start_p));
                             ui.ctx().request_repaint();
                         }
                         if resp.drag_stopped() {
-                            view.line_properties.last_error = Some(
-                                "line endpoint editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
-                            );
+                            if let Some((handle, final_user_p, start_user_p)) = view.line_drag.take()
+                                && let Some(sel) = view.canvas_selection.selected.as_mut()
+                                && sel.page == i
+                                && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                                && let Some(line) = sel.line.as_mut()
+                            {
+                                let (new_start, new_end) = match handle {
+                                    crate::canvas_selection::SelectionHandle::LineStart => (final_user_p, line.end),
+                                    crate::canvas_selection::SelectionHandle::LineEnd => (line.start, final_user_p),
+                                    crate::canvas_selection::SelectionHandle::Move => {
+                                        let dx = final_user_p[0] - start_user_p[0];
+                                        let dy = final_user_p[1] - start_user_p[1];
+                                        ([line.start[0] + dx, line.start[1] + dy], [line.end[0] + dx, line.end[1] + dy])
+                                    }
+                                    _ => (line.start, line.end),
+                                };
+                                if (new_start[0] - new_end[0]).hypot(new_start[1] - new_end[1]) > 1e-4 {
+                                    line.start = new_start;
+                                    line.end = new_end;
+                                    sel.user_rect = [
+                                        new_start[0].min(new_end[0]),
+                                        new_start[1].min(new_end[1]),
+                                        new_start[0].max(new_end[0]),
+                                        new_start[1].max(new_end[1]),
+                                    ];
+                                    let target = pdfcraft_engine::ObjectTarget {
+                                        kind: pdfcraft_engine::ObjectKind::VectorLine,
+                                        index: line.index,
+                                    };
+                                    view.pending_edit = Some(Edit::UpdateLineEndpoints {
+                                        page: i,
+                                        target,
+                                        new_start,
+                                        new_end,
+                                    });
+                                }
+                            }
                             view.line_drag = None;
                             view.canvas_selection.active_handle = None;
                             ui.ctx().request_repaint();
@@ -3638,20 +3690,32 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 (matches!(tool, QuickTool::Select | QuickTool::Fill(_)) && !comments_hidden).then_some(view.comments.selected).flatten();
             view.signature_drag.prepare(ui.ctx(), doc, preview_target, scale);
             view.signature_drag.paint(painter, &pcx, &view.comments, view.pending_edit.as_ref());
-            if let Some(edit) =
-                crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(ui, painter, i, &xf, info, &mut view.canvas_selection)
-            {
+            if let Some(edit) = crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(
+                ui,
+                painter,
+                i,
+                &xf,
+                info,
+                &mut view.canvas_selection,
+                view.line_editor.as_mut(),
+            ) {
                 view.pending_edit = Some(edit);
             }
             if let Some(sel) = &view.canvas_selection.selected
                 && sel.page == i
                 && let Some(line) = &sel.line
             {
-                let preview_line = if let Some((h, user_p)) = &view.line_drag {
+                let preview_line = if let Some((h, user_p, start_p)) = &view.line_drag {
                     let mut pl = line.clone();
                     match h {
                         crate::canvas_selection::SelectionHandle::LineStart => pl.start = *user_p,
                         crate::canvas_selection::SelectionHandle::LineEnd => pl.end = *user_p,
+                        crate::canvas_selection::SelectionHandle::Move => {
+                            let dx = user_p[0] - start_p[0];
+                            let dy = user_p[1] - start_p[1];
+                            pl.start = [line.start[0] + dx, line.start[1] + dy];
+                            pl.end = [line.end[0] + dx, line.end[1] + dy];
+                        }
                         _ => {}
                     }
                     pl
@@ -5400,6 +5464,18 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                                 app.put_down_edit_text();
                             } else {
                                 app.quick_tool = QuickTool::EditText;
+                            }
+                        }
+                    }
+                    // Vector Line Edit tool button
+                    if let Some((tab_idx, _)) = app.active_ids() {
+                        let vector_active = app.views.get(tab_idx).is_some_and(|v| v.vector_edit_mode);
+                        if icons::button(ui, "spline", 32.0, vector_active, tl!("Vector Line Edit")).clicked()
+                            && let Some(v) = app.views.get_mut(tab_idx)
+                        {
+                            v.vector_edit_mode = !v.vector_edit_mode;
+                            if v.vector_edit_mode {
+                                app.quick_tool = QuickTool::Select;
                             }
                         }
                     }

@@ -187,19 +187,6 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
     }
     // Edit a PDF shows Format text at the top while text is selected or being added.
     if g.id == "edit" {
-        if let Some(i) = app.active {
-            if let Some(view) = app.views.get_mut(i) {
-                ui.horizontal(|ui| {
-                    if widgets::pill_button(ui, tl!("Vector Edit"), view.vector_edit_mode)
-                        .on_hover_text(tl!("Toggle vector line editing mode"))
-                        .clicked()
-                    {
-                        view.vector_edit_mode = !view.vector_edit_mode;
-                    }
-                });
-                ui.add_space(6.0);
-            }
-        }
         if app.quick_tool == crate::QuickTool::EditText {
             let count = app.active_ids().map_or(0, |(i, _)| app.views[i].objects.count());
             if count > 0 {
@@ -389,8 +376,7 @@ fn stamp_palette(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
 fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     if let Some((i, _)) = app.active_ids() {
         let view = &mut app.views[i];
-        let mut dummy = pdfcraft_cos::Document::new_empty();
-        crate::editing::line_properties_panel(ui, &mut dummy, view);
+        crate::editing::line_properties_panel(ui, view);
     }
     // Editing a paragraph of existing text: its formatting, applied as it changes.
     if let Some((i, _)) = app.active_ids()

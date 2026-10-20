@@ -956,7 +956,10 @@ fn content_page(edit: &Edit) -> Option<usize> {
         | Edit::AddImage { page, .. }
         | Edit::UpdateContent { page, .. }
         | Edit::DeleteContent { page, .. }
-        | Edit::ReplaceImage { page, .. } => Some(*page),
+        | Edit::ReplaceImage { page, .. }
+        | Edit::UpdateLineEndpoints { page, .. }
+        | Edit::SetLineProperties { page, .. } => Some(*page),
+        Edit::Batch { edits, .. } => edits.first().and_then(content_page),
         _ => None,
     }
 }
@@ -1121,7 +1124,6 @@ fn bookmark_at<'a>(items: &'a [pdfcraft_render::OutlineItem], path: &[usize]) ->
 /// Line Properties panel for vector line editing.
 pub fn line_properties_panel(
     ui: &mut egui::Ui,
-    doc: &mut pdfcraft_cos::Document,
     view: &mut crate::canvas::DocView,
 ) {
     if !view.vector_edit_mode {
@@ -1179,14 +1181,15 @@ pub fn line_properties_panel(
                 2 => Some(vec![6.0, 3.0]),
                 _ => Some(vec![]),
             };
-            match pdfcraft_engine::set_line_properties(doc, page, target, color, width, dash) {
-                Ok(()) => {
-                    view.line_properties.last_error = None;
-                }
-                Err(e) => {
-                    view.line_properties.last_error = Some(e.to_string());
-                }
-            }
+            view.pending_edit = Some(pdfcraft_engine::Edit::SetLineProperties {
+                page,
+                target,
+                color,
+                width,
+                dash,
+            });
+            view.line_properties.last_error = None;
+            ui.ctx().request_repaint();
         }
 
         if let Some(err) = &view.line_properties.last_error {

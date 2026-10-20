@@ -229,6 +229,8 @@ pub struct SelectionState {
     pub active_handle: Option<SelectionHandle>,
     /// Screen position where a drag began.
     pub drag_start: Option<Pos2>,
+    /// User rectangle when handle drag began.
+    pub drag_start_rect: Option<[f64; 4]>,
     /// Format painter clipboard holding captured formatting.
     pub format_painter: Option<CapturedFormat>,
     /// Whether the symbol palette modal is open.
@@ -243,6 +245,7 @@ impl SelectionState {
         self.multi_selected.clear();
         self.active_handle = None;
         self.drag_start = None;
+        self.drag_start_rect = None;
         self.symbol_palette_open = false;
     }
 
@@ -302,6 +305,7 @@ impl SelectionLayoutEngine {
         xf: &PageXform,
         info: &DocInfo,
         state: &mut SelectionState,
+        mut line_editor: Option<&mut crate::edit_text_ui::LineEditor>,
     ) -> Option<Edit> {
         if page >= info.pages.len() {
             return None;
@@ -325,10 +329,11 @@ impl SelectionLayoutEngine {
 
         // Paint primary selected element bounding box with 8 handles and wire dragging interactions.
         if let Some(sel) = &mut state.selected {
-            if sel.page != page {
+            if sel.page != page || sel.kind == SelectableKind::VectorLine {
                 return None;
             }
-            let rect = sel.screen_rect(xf, info).expand(2.0);
+            let unpadded_rect = sel.screen_rect(xf, info);
+            let rect = unpadded_rect.expand(2.0);
             let handle_size = 7.0;
             let mut handle_dragged = None;
             let mut drag_stopped = false;
@@ -339,6 +344,10 @@ impl SelectionLayoutEngine {
 
                 if resp.hovered() || resp.dragged() {
                     ui.ctx().set_cursor_icon(handle.cursor_icon());
+                }
+
+                if resp.drag_started() {
+                    state.drag_start_rect = Some(sel.user_rect);
                 }
 
                 if resp.dragged() {
@@ -354,15 +363,23 @@ impl SelectionLayoutEngine {
             }
 
             let active_rect = if let Some((handle, delta)) = handle_dragged {
-                let new_screen_rect = handle.resize_rect(rect, delta);
+                let new_screen_rect = handle.resize_rect(unpadded_rect, delta);
                 if let Some(p) = info.pages.get(page) {
                     let (a, b) = (xf.screen_to_view(new_screen_rect.min), xf.screen_to_view(new_screen_rect.max));
                     let (u, v) = (p.view_to_user(a.0, a.1), p.view_to_user(b.0, b.1));
                     sel.user_rect = [u[0].min(v[0]) as f64, u[1].min(v[1]) as f64, u[0].max(v[0]) as f64, u[1].max(v[1]) as f64];
+                    if let Some(ed) = line_editor.as_deref_mut()
+                        && ed.page == sel.page
+                        && ed.block == sel.index
+                    {
+                        ed.source_rect = [sel.user_rect[0] as f32, sel.user_rect[1] as f32, sel.user_rect[2] as f32, sel.user_rect[3] as f32];
+                        ed.rect = xf.user_rect(info, ed.page, ed.source_rect);
+                        ed.max_width = ed.rect.width();
+                    }
                 }
                 state.active_handle = Some(handle);
                 ui.ctx().request_repaint();
-                new_screen_rect
+                new_screen_rect.expand(2.0)
             } else {
                 rect
             };
@@ -378,21 +395,53 @@ impl SelectionLayoutEngine {
             }
 
             if drag_stopped {
+                let start_rect = state.drag_start_rect.take().unwrap_or(sel.user_rect);
+                let offset = [sel.user_rect[0] - start_rect[0], sel.user_rect[1] - start_rect[1]];
                 match sel.kind {
                     SelectableKind::TextBlock => {
                         let new_w = (sel.user_rect[2] - sel.user_rect[0]).max(10.0);
-                        pending_edit = Some(Edit::EditTextBlock {
+                        let mut edits = Vec::new();
+                        if offset[0].abs() > 0.001 || offset[1].abs() > 0.001 {
+                            edits.push(Edit::MoveObjects {
+                                page: sel.page,
+                                objects: vec![pdfcraft_engine::ObjectTarget {
+                                    kind: pdfcraft_engine::ObjectKind::Text,
+                                    index: sel.index,
+                                }],
+                                offset,
+                            });
+                        }
+                        let text = if let Some(ed) = line_editor.as_deref()
+                            && ed.page == sel.page && ed.block == sel.index
+                        {
+                            ed.text.clone()
+                        } else {
+                            sel.text.clone().unwrap_or_default()
+                        };
+                        edits.push(Edit::EditTextBlock {
                             page: sel.page,
                             block: sel.index,
-                            text: sel.text.clone().unwrap_or_default(),
+                            text,
                             style: pdfcraft_engine::BlockStyle { width: Some(new_w), ..Default::default() },
+                        });
+                        pending_edit = Some(if edits.len() == 1 {
+                            edits.remove(0)
+                        } else {
+                            Edit::Batch { label: "Resize text box".into(), edits }
                         });
                     }
                     SelectableKind::Image => {
                         pending_edit = Some(Edit::EditPageImage { page: sel.page, index: sel.index, change: ImageEdit::Move(sel.user_rect) });
                     }
                     SelectableKind::TextLine => {
-                        pending_edit = Some(Edit::EditTextLine { page: sel.page, line: sel.index, text: sel.text.clone().unwrap_or_default() });
+                        let text = if let Some(ed) = line_editor.as_deref()
+                            && ed.page == sel.page && ed.block == sel.index
+                        {
+                            ed.text.clone()
+                        } else {
+                            sel.text.clone().unwrap_or_default()
+                        };
+                        pending_edit = Some(Edit::EditTextLine { page: sel.page, line: sel.index, text });
                     }
                     SelectableKind::AddedContent | SelectableKind::VectorLine => {}
                 }
@@ -543,6 +592,9 @@ impl FloatingContextMenu {
         }
 
         let sel = view.canvas_selection.selected.as_ref()?;
+        if sel.kind == SelectableKind::VectorLine {
+            return None;
+        }
         let xf = view.page_xform(sel.page)?;
         let screen_rect = sel.screen_rect(&xf, info);
 

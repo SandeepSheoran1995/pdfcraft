@@ -163,16 +163,87 @@ pub fn set_line_properties(
         return Err(EditError::Invalid("dash values must be finite, between 0.0 and 100.0, and have length <= 8".into()));
     }
 
-    // 2. Re-derive the line inventory:
-    let inventory = editable_lines(doc, page)?;
+    let p = pdfcraft_model::pages(doc).into_iter().nth(page).ok_or(EditError::NoSuchPage(page))?;
+    let streams = checked_streams(doc, page)?;
+    let parsed_lines = parse_page_lines(&streams)?;
+    let target_line = parsed_lines.get(target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
 
-    // 3. Find the target by (page, index):
-    let _line = inventory.iter().find(|l| l.index == target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
+    let pieces = Pieces::join(&streams.iter().map(|(_, bytes)| bytes.as_slice()).collect::<Vec<_>>());
+    let ops = pieces.parse().ops;
 
-    // 4. Content stream mutation path is not yet available in the edit crate:
-    Err(EditError::Invalid(
-        "line property editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
-    ))
+    let m_op = ops.get(target_line.m_op_idx).ok_or_else(|| EditError::Invalid("line moveto operator missing".into()))?;
+    let last_l_idx = *target_line.l_op_indices.last().ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+    let last_l_op = ops.get(last_l_idx).ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+    let stroke_op = ops.get(target_line.stroke_op_idx).ok_or_else(|| EditError::Invalid("line stroke operator missing".into()))?;
+
+    // Check if there are preceding path construction operators before m_op within the current path.
+    let mut has_preceding_path = false;
+    for idx in (0..target_line.m_op_idx).rev() {
+        let op = &ops[idx];
+        match op.op.as_slice() {
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" => {
+                has_preceding_path = true;
+                break;
+            }
+            b"S" | b"s" | b"f" | b"f*" | b"F" | b"b" | b"b*" | b"B" | b"B*" | b"n" | b"q" | b"Q" => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Check if there are subsequent path construction operators after target_line before stroke_op.
+    let has_subsequent_path = ((last_l_idx + 1)..target_line.stroke_op_idx).any(|idx| {
+        let op = &ops[idx];
+        matches!(op.op.as_slice(), b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re")
+    });
+
+    let mut prefix_bytes = Vec::new();
+    if has_preceding_path {
+        prefix_bytes.extend_from_slice(b"\nS\n");
+    }
+
+    let mut prefix_ops: Vec<Op> = Vec::new();
+    prefix_ops.push(Op::new("q", Vec::new()));
+
+    if let Some(c) = color {
+        prefix_ops.push(Op::new("RG", vec![pdfcraft_content::num(c[0]), pdfcraft_content::num(c[1]), pdfcraft_content::num(c[2])]));
+    }
+    if let Some(w) = width {
+        let [a, b, c, d, _, _] = target_line.matrix.0;
+        let scale = ((a * a + b * b).sqrt() + (c * c + d * d).sqrt()) / 2.0;
+        let local_w = if scale > 1e-6 { w / scale } else { w };
+        prefix_ops.push(Op::new("w", vec![pdfcraft_content::num(local_w)]));
+    }
+    if let Some(ref d) = dash {
+        let dash_array = Object::Array(d.iter().copied().map(pdfcraft_content::num).collect());
+        prefix_ops.push(Op::new("d", vec![dash_array, pdfcraft_content::num(0.0)]));
+    }
+
+    prefix_bytes.push(b'\n');
+    prefix_bytes.extend_from_slice(&pdfcraft_content::serialize_ops(&prefix_ops));
+    if prefix_bytes.last() != Some(&b'\n') && prefix_bytes.last() != Some(&b' ') {
+        prefix_bytes.push(b'\n');
+    }
+
+    let mut suffix_bytes = Vec::new();
+    suffix_bytes.extend_from_slice(b"\nS\nQ\n");
+
+    let mut edits: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
+    edits.push((m_op.span.start..m_op.span.start, prefix_bytes));
+    edits.push((last_l_op.span.end..last_l_op.span.end, suffix_bytes));
+
+    if !has_subsequent_path {
+        // If there are no subsequent segments in this path, replace original stroke_op
+        edits.push((stroke_op.span.clone(), b"\n".to_vec()));
+    }
+
+    edits.sort_by_key(|(span, _)| span.start);
+
+    let data = pieces.splice(edits);
+    let contents = crate::text::rewritten_contents(doc, &streams, data);
+    doc.update_dict(p.obj, |d| d.set(b"Contents".to_vec(), contents))?;
+    Ok(())
 }
 
 /// Update endpoints for a vector line segment on a page.
@@ -187,20 +258,57 @@ pub fn update_line_endpoints(doc: &mut Document, page: usize, target: ObjectTarg
     if new_start == new_end {
         return Err(EditError::Invalid("new_start and new_end must not be identical (zero-length line)".into()));
     }
-    if pdfcraft_model::pages(doc).into_iter().nth(page).is_none() {
-        return Err(EditError::NoSuchPage(page));
-    }
+    let p = pdfcraft_model::pages(doc).into_iter().nth(page).ok_or(EditError::NoSuchPage(page))?;
 
     // 2. Re-derive the line inventory:
-    let inventory = editable_lines(doc, page)?;
+    let streams = checked_streams(doc, page)?;
+    let parsed_lines = parse_page_lines(&streams)?;
+    let target_line = parsed_lines.get(target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
 
-    // 3. Find the target by (page, index):
-    let _line = inventory.iter().find(|l| l.index == target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
+    let inv = target_line.matrix.invert().ok_or_else(|| EditError::Invalid("line coordinate transform is singular".into()))?;
+    let (local_start_x, local_start_y) = inv.apply(new_start[0], new_start[1]);
+    let (local_end_x, local_end_y) = inv.apply(new_end[0], new_end[1]);
 
-    // 4. Content stream mutation path is not yet available in the edit crate (stubbed per D6d):
-    Err(EditError::Invalid(
-        "line endpoint editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
-    ))
+    if !local_start_x.is_finite() || !local_start_y.is_finite() || !local_end_x.is_finite() || !local_end_y.is_finite() {
+        return Err(EditError::Invalid("transformed coordinates must be finite".into()));
+    }
+
+    let pieces = Pieces::join(&streams.iter().map(|(_, bytes)| bytes.as_slice()).collect::<Vec<_>>());
+    let ops = pieces.parse().ops;
+
+    let m_op = ops.get(target_line.m_op_idx).ok_or_else(|| EditError::Invalid("line moveto operator missing".into()))?;
+    let last_l_idx = *target_line.l_op_indices.last().ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+    let last_l_op = ops.get(last_l_idx).ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+
+    let mut edits: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
+
+    let mut m_bytes =
+        pdfcraft_content::serialize_ops(&[Op::new("m", vec![pdfcraft_content::num(local_start_x), pdfcraft_content::num(local_start_y)])]);
+    if m_bytes.last() == Some(&b'\n') {
+        m_bytes.pop();
+    }
+    edits.push((m_op.span.clone(), m_bytes));
+
+    if target_line.l_op_indices.len() > 1 {
+        for &l_idx in &target_line.l_op_indices[..target_line.l_op_indices.len() - 1] {
+            if let Some(l_op) = ops.get(l_idx) {
+                edits.push((l_op.span.clone(), Vec::new()));
+            }
+        }
+    }
+
+    let mut l_bytes = pdfcraft_content::serialize_ops(&[Op::new("l", vec![pdfcraft_content::num(local_end_x), pdfcraft_content::num(local_end_y)])]);
+    if l_bytes.last() == Some(&b'\n') {
+        l_bytes.pop();
+    }
+    edits.push((last_l_op.span.clone(), l_bytes));
+
+    edits.sort_by_key(|(span, _)| span.start);
+
+    let data = pieces.splice(edits);
+    let contents = crate::text::rewritten_contents(doc, &streams, data);
+    doc.update_dict(p.obj, |d| d.set(b"Contents".to_vec(), contents))?;
+    Ok(())
 }
 
 struct AddedGeometry {
@@ -467,29 +575,275 @@ impl LineSegment {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ParsedLine {
+    start: [f64; 2],
+    end: [f64; 2],
+    thickness: f64,
+    #[allow(dead_code)]
+    color: [f64; 3],
+    #[allow(dead_code)]
+    dash: (Vec<f64>, f64),
+    matrix: Matrix,
+    m_op_idx: usize,
+    l_op_indices: Vec<usize>,
+    stroke_op_idx: usize,
+}
+
+fn parse_page_lines(streams: &[(Object, Vec<u8>)]) -> Result<Vec<ParsedLine>, EditError> {
+    let pieces = Pieces::join(&streams.iter().map(|(_, bytes)| bytes.as_slice()).collect::<Vec<_>>());
+    let parsed = pieces.parse();
+    let ops = &parsed.ops;
+
+    #[derive(Clone)]
+    struct GState {
+        matrix: Matrix,
+        width: f64,
+        color: [f64; 3],
+        dash: (Vec<f64>, f64),
+    }
+
+    let mut state = GState {
+        matrix: Matrix::IDENTITY,
+        width: 1.0,
+        color: [0.0, 0.0, 0.0],
+        dash: (Vec::new(), 0.0),
+    };
+    let mut stack: Vec<GState> = Vec::new();
+
+    struct PendingSeg {
+        start_user: [f64; 2],
+        end_user: [f64; 2],
+        thickness: f64,
+        color: [f64; 3],
+        dash: (Vec<f64>, f64),
+        matrix: Matrix,
+        m_op_idx: usize,
+        l_op_idx: usize,
+    }
+
+    let mut current_point: Option<([f64; 2], [f64; 2])> = None;
+    let mut subpath_start: Option<([f64; 2], [f64; 2])> = None;
+    let mut current_m_idx: usize = 0;
+    let mut pending_segs: Vec<PendingSeg> = Vec::new();
+    let mut raw_lines: Vec<ParsedLine> = Vec::new();
+
+    for (idx, op) in ops.iter().enumerate() {
+        match op.op.as_slice() {
+            b"q" => {
+                if stack.len() >= 1024 {
+                    return Err(EditError::Invalid("the page graphics state is nested too deeply".into()));
+                }
+                stack.push(state.clone());
+            }
+            b"Q" => {
+                if let Some(prev) = stack.pop() {
+                    state = prev;
+                }
+            }
+            b"cm" => {
+                if let Some(m) = op.nums::<6>() {
+                    state.matrix = Matrix(m).then(&state.matrix);
+                }
+            }
+            b"w" => {
+                if let Some(w) = op.num(0)
+                    && w.is_finite() && w >= 0.0
+                {
+                    state.width = w;
+                }
+            }
+            b"RG" => {
+                if let Some(rgb) = op.nums::<3>()
+                    && rgb.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                {
+                    state.color = rgb;
+                }
+            }
+            b"G" => {
+                if let Some(g) = op.num(0)
+                    && g.is_finite() && (0.0..=1.0).contains(&g)
+                {
+                    state.color = [g, g, g];
+                }
+            }
+            b"K" => {
+                if let Some([c, m, y, k]) = op.nums::<4>()
+                    && [c, m, y, k].iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                {
+                    state.color = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
+                }
+            }
+            b"d" => {
+                if let Some(arr) = op.operands.first().and_then(Object::as_array) {
+                    let dash_vec: Vec<f64> = arr.iter().filter_map(Object::as_f64).collect();
+                    let phase = op.num(1).unwrap_or(0.0);
+                    state.dash = (dash_vec, phase);
+                }
+            }
+            b"m" => {
+                if let Some([x, y]) = op.nums::<2>() {
+                    let (ux, uy) = state.matrix.apply(x, y);
+                    current_point = Some(([x, y], [ux, uy]));
+                    subpath_start = Some(([x, y], [ux, uy]));
+                    current_m_idx = idx;
+                }
+            }
+            b"l" => {
+                if let Some([x, y]) = op.nums::<2>() {
+                    let (ux, uy) = state.matrix.apply(x, y);
+                    if let Some((_prev_local, prev_user)) = current_point {
+                        let dx = ux - prev_user[0];
+                        let dy = uy - prev_user[1];
+                        if (dx * dx + dy * dy).sqrt() > 1e-4 {
+                            let [a, b, c, d, _, _] = state.matrix.0;
+                            let scale = ((a * a + b * b).sqrt() + (c * c + d * d).sqrt()) / 2.0;
+                            let thickness = if scale > 1e-6 { (state.width * scale).max(0.1) } else { state.width.max(0.1) };
+                            pending_segs.push(PendingSeg {
+                                start_user: prev_user,
+                                end_user: [ux, uy],
+                                thickness,
+                                color: state.color,
+                                dash: state.dash.clone(),
+                                matrix: state.matrix,
+                                m_op_idx: current_m_idx,
+                                l_op_idx: idx,
+                            });
+                        }
+                    }
+                    current_point = Some(([x, y], [ux, uy]));
+                }
+            }
+            b"h" => {
+                if let (Some((_prev_local, prev_user)), Some((start_local, start_user))) = (current_point, subpath_start) {
+                    let dx = start_user[0] - prev_user[0];
+                    let dy = start_user[1] - prev_user[1];
+                    if (dx * dx + dy * dy).sqrt() > 1e-4 {
+                        let [a, b, c, d, _, _] = state.matrix.0;
+                        let scale = ((a * a + b * b).sqrt() + (c * c + d * d).sqrt()) / 2.0;
+                        let thickness = if scale > 1e-6 { (state.width * scale).max(0.1) } else { state.width.max(0.1) };
+                        pending_segs.push(PendingSeg {
+                            start_user: prev_user,
+                            end_user: start_user,
+                            thickness,
+                            color: state.color,
+                            dash: state.dash.clone(),
+                            matrix: state.matrix,
+                            m_op_idx: current_m_idx,
+                            l_op_idx: idx,
+                        });
+                    }
+                    current_point = Some((start_local, start_user));
+                }
+            }
+            b"c" => {
+                if let Some(pts) = op.nums::<6>() {
+                    let (ux, uy) = state.matrix.apply(pts[4], pts[5]);
+                    current_point = Some(([pts[4], pts[5]], [ux, uy]));
+                }
+            }
+            b"v" | b"y" => {
+                if let Some(pts) = op.nums::<4>() {
+                    let (ux, uy) = state.matrix.apply(pts[2], pts[3]);
+                    current_point = Some(([pts[2], pts[3]], [ux, uy]));
+                }
+            }
+            b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" => {
+                if matches!(op.op.as_slice(), b"s" | b"b" | b"b*")
+                    && let (Some((_prev_local, prev_user)), Some((_start_local, start_user))) = (current_point, subpath_start)
+                {
+                    let dx = start_user[0] - prev_user[0];
+                    let dy = start_user[1] - prev_user[1];
+                    if (dx * dx + dy * dy).sqrt() > 1e-4 {
+                        let [a, b, c, d, _, _] = state.matrix.0;
+                        let scale = ((a * a + b * b).sqrt() + (c * c + d * d).sqrt()) / 2.0;
+                        let thickness = if scale > 1e-6 { (state.width * scale).max(0.1) } else { state.width.max(0.1) };
+                        pending_segs.push(PendingSeg {
+                            start_user: prev_user,
+                            end_user: start_user,
+                            thickness,
+                            color: state.color,
+                            dash: state.dash.clone(),
+                            matrix: state.matrix,
+                            m_op_idx: current_m_idx,
+                            l_op_idx: idx,
+                        });
+                    }
+                }
+                for seg in pending_segs.drain(..) {
+                    raw_lines.push(ParsedLine {
+                        start: seg.start_user,
+                        end: seg.end_user,
+                        thickness: seg.thickness,
+                        color: seg.color,
+                        dash: seg.dash,
+                        matrix: seg.matrix,
+                        m_op_idx: seg.m_op_idx,
+                        l_op_indices: vec![seg.l_op_idx],
+                        stroke_op_idx: idx,
+                    });
+                }
+                current_point = None;
+                subpath_start = None;
+            }
+            b"f" | b"f*" | b"F" | b"n" => {
+                pending_segs.clear();
+                current_point = None;
+                subpath_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(merge_collinear_parsed(raw_lines))
+}
+
+fn merge_collinear_parsed(raw: Vec<ParsedLine>) -> Vec<ParsedLine> {
+    let mut out: Vec<ParsedLine> = Vec::with_capacity(raw.len());
+    for item in raw {
+        if let Some(last) = out.last_mut() {
+            let ls = last.start;
+            let le = last.end;
+            let lw = last.thickness;
+            if (lw - item.thickness).abs() < MERGE_DIST_EPS
+                && endpoints_merge(le, item.start)
+                && collinear(ls, le, item.end)
+                && last.matrix == item.matrix
+                && last.stroke_op_idx == item.stroke_op_idx
+            {
+                last.end = item.end;
+                last.l_op_indices.extend(item.l_op_indices);
+                continue;
+            }
+        }
+        out.push(item);
+    }
+    out
+}
+
 /// Enumerate stroked line segments on `page`, merging collinear adjacent ones.
 pub fn editable_lines(doc: &Document, page: usize) -> Result<Vec<LineSegment>, EditError> {
-    checked_streams(doc, page)?;
+    let streams = checked_streams(doc, page)?;
+    let parsed_lines = parse_page_lines(&streams)?;
 
-    // ADAPT: replace this block with a call into the content-stream parser.
-    // Expected shape: walk the page's content ops, and for each moveto-lineto-stroke
-    // sequence, push a raw (start, end, thickness). Then pass the raw list through
-    // merge_collinear below.
-    let raw: Vec<([f64; 2], [f64; 2], f64)> = {
-        // TODO(session-1): wire to pdfcraft_content::Op (Op is a struct at crates/content/src/lib.rs:17, not an enum with stroke variants).
-        // The rest of this function is final once the raw list is produced.
-        Vec::new()
-    };
-
-    let merged = merge_collinear(&raw);
-
-    if merged.len() > MAX_PAGE_LINES {
+    if parsed_lines.len() > MAX_PAGE_LINES {
         return Err(EditError::Invalid("this page has too many line segments to edit as a group".into()));
     }
 
-    Ok(merged.into_iter().enumerate().map(|(index, (start, end, thickness))| LineSegment { page, index, start, end, thickness }).collect())
+    Ok(parsed_lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, pl)| LineSegment {
+            page,
+            index,
+            start: pl.start,
+            end: pl.end,
+            thickness: pl.thickness,
+        })
+        .collect())
 }
 
+#[cfg(test)]
 fn merge_collinear(raw: &[([f64; 2], [f64; 2], f64)]) -> Vec<([f64; 2], [f64; 2], f64)> {
     let mut out: Vec<([f64; 2], [f64; 2], f64)> = Vec::with_capacity(raw.len());
     for &(s, e, w) in raw {
@@ -623,5 +977,77 @@ mod line_tests {
         let res = update_line_endpoints(&mut doc, 0, target, [0.0, 0.0], [10.0, 0.0]);
         let err = res.unwrap_err().to_string();
         assert!(err.contains("kind"), "expected error containing 'kind', got: {err}");
+    }
+
+    #[test]
+    fn test_vector_line_round_trip_edit_and_properties() {
+        let mut doc = Document::new_empty();
+        let pages = doc.get(doc.root().unwrap()).as_dict().unwrap().reference(b"Pages").unwrap();
+        let stream_bytes = b"10 20 m 100 20 l S\n".to_vec();
+        let stream = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(Dict::new(), stream_bytes))));
+        let mut page = Dict::new();
+        page.set(b"Type".to_vec(), Object::name("Page"));
+        page.set(b"Parent".to_vec(), Object::Ref(pages));
+        page.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 600.into(), 800.into()]));
+        page.set(b"Contents".to_vec(), Object::Array(vec![stream]));
+        let page = doc.add(page);
+        doc.update_dict(pages, |d| {
+            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
+            d.set(b"Count".to_vec(), Object::Int(1));
+        })
+        .unwrap();
+
+        let lines = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].start, [10.0, 20.0]);
+        assert_eq!(lines[0].end, [100.0, 20.0]);
+        assert!((lines[0].thickness - 1.0).abs() < 1e-6);
+
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        update_line_endpoints(&mut doc, 0, target, [15.0, 25.0], [105.0, 25.0]).unwrap();
+
+        let lines2 = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines2.len(), 1);
+        assert_eq!(lines2[0].start, [15.0, 25.0]);
+        assert_eq!(lines2[0].end, [105.0, 25.0]);
+
+        set_line_properties(&mut doc, 0, target, Some([1.0, 0.0, 0.0]), Some(3.5), Some(vec![4.0, 2.0])).unwrap();
+
+        let lines3 = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines3.len(), 1);
+        assert!((lines3[0].thickness - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vector_line_multi_subpath_isolation() {
+        let mut doc = Document::new_empty();
+        let pages = doc.get(doc.root().unwrap()).as_dict().unwrap().reference(b"Pages").unwrap();
+        // 2 subpaths sharing a single stroke operator S:
+        let stream_bytes = b"10 20 m 100 20 l 10 40 m 100 40 l S\n".to_vec();
+        let stream = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(Dict::new(), stream_bytes))));
+        let mut page = Dict::new();
+        page.set(b"Type".to_vec(), Object::name("Page"));
+        page.set(b"Parent".to_vec(), Object::Ref(pages));
+        page.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 600.into(), 800.into()]));
+        page.set(b"Contents".to_vec(), Object::Array(vec![stream]));
+        let page = doc.add(page);
+        doc.update_dict(pages, |d| {
+            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
+            d.set(b"Count".to_vec(), Object::Int(1));
+        })
+        .unwrap();
+
+        let lines = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines.len(), 2);
+
+        // Edit properties of line 1 (the second subpath):
+        let target1 = ObjectTarget { kind: ObjectKind::VectorLine, index: 1 };
+        set_line_properties(&mut doc, 0, target1, Some([1.0, 0.0, 0.0]), Some(4.0), None).unwrap();
+
+        let lines_after = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines_after.len(), 2, "both lines must be preserved");
+        assert_eq!(lines_after[0].start, [10.0, 20.0]);
+        assert_eq!(lines_after[1].start, [10.0, 40.0]);
+        assert!((lines_after[1].thickness - 4.0).abs() < 1e-6);
     }
 }
