@@ -363,10 +363,8 @@ fn try_decode_code128(runs: &[(bool, usize)], start_run_idx: usize) -> Option<(S
                     calc_sum = calc_sum.saturating_add((weight + 1).saturating_mul(sym));
                 }
                 if (calc_sum % 103) != checksum {
-                    // Tolerant fallback for slight scanning jitter: accept if symbols >= 3
-                    if symbols.len() < 3 {
-                        return None;
-                    }
+                    // A checksum mismatch is a misread: never report it as a code.
+                    return None;
                 }
 
                 // Decode symbols to ASCII string based on start code mode
@@ -650,249 +648,6 @@ fn scan_1d_barcodes(binary: &BinaryImage, codes: &mut Vec<ScannedCode>, page: us
     }
 }
 
-// -------------------------------------------------------------------------------------------------
-// QR Code Detection & Decoding
-// -------------------------------------------------------------------------------------------------
-
-fn is_finder_ratio(runs: &[usize; 5]) -> bool {
-    let total: usize = runs.iter().sum();
-    if total < 7 {
-        return false;
-    }
-    let module_size = (total as f32) / 7.0;
-    let max_variance = module_size * 0.75;
-
-    let expected = [module_size, module_size, module_size * 3.0, module_size, module_size];
-    for (r, exp) in runs.iter().zip(expected.iter()) {
-        if ((*r as f32) - exp).abs() > max_variance {
-            return false;
-        }
-    }
-    true
-}
-
-fn scan_qr_codes(binary: &BinaryImage, codes: &mut Vec<ScannedCode>, page: usize) {
-    let w = binary.width;
-    let h = binary.height;
-    if w < 21 || h < 21 {
-        return;
-    }
-
-    let mut finder_centers: Vec<[usize; 2]> = Vec::new();
-    let step = (h / 70).max(2);
-
-    for y in (0..h).step_by(step) {
-        let mut runs = [0usize; 5];
-        let mut current_state = 0;
-        let mut is_dark = false;
-
-        for x in 0..w {
-            let pixel_dark = binary.is_dark(x, y);
-            if pixel_dark == is_dark {
-                if let Some(r) = runs.get_mut(current_state) {
-                    *r = r.saturating_add(1);
-                }
-            } else {
-                if !is_dark {
-                    if current_state == 4 {
-                        if is_finder_ratio(&runs) {
-                            let center_x = x.saturating_sub(runs[4] + runs[3] + runs[2] / 2);
-                            finder_centers.push([center_x, y]);
-                        }
-                        runs[0] = runs[2];
-                        runs[1] = runs[3];
-                        runs[2] = runs[4];
-                        runs[3] = 1;
-                        runs[4] = 0;
-                        current_state = 3;
-                    } else {
-                        current_state = current_state.saturating_add(1);
-                        if let Some(r) = runs.get_mut(current_state) {
-                            *r = 1;
-                        }
-                    }
-                } else {
-                    current_state = current_state.saturating_add(1);
-                    if let Some(r) = runs.get_mut(current_state) {
-                        *r = 1;
-                    }
-                }
-                is_dark = pixel_dark;
-            }
-        }
-    }
-
-    if finder_centers.len() >= 3 {
-        let mut min_x = usize::MAX;
-        let mut max_x = 0usize;
-        let mut min_y = usize::MAX;
-        let mut max_y = 0usize;
-
-        for pt in &finder_centers {
-            min_x = min_x.min(pt[0]);
-            max_x = max_x.max(pt[0]);
-            min_y = min_y.min(pt[1]);
-            max_y = max_y.max(pt[1]);
-        }
-
-        let pad = ((max_x - min_x) / 7).max(10);
-        let min_x = min_x.saturating_sub(pad);
-        let max_x = (max_x + pad).min(w);
-        let min_y = min_y.saturating_sub(pad);
-        let max_y = (max_y + pad).min(h);
-
-        let qr_w = (max_x - min_x) as u32;
-        let qr_h = (max_y - min_y) as u32;
-
-        if let Some(decoded_text) = try_direct_grid_decode(binary) {
-            codes.push(ScannedCode {
-                id: codes.len(),
-                page,
-                kind: CodeKind::QrCode,
-                text: decoded_text,
-                rect: [min_x as f64, min_y as f64, max_x as f64, max_y as f64],
-                pixel_size: [qr_w, qr_h],
-                image_index: None,
-            });
-        }
-    } else if let Some(text) = try_direct_grid_decode(binary) {
-        codes.push(ScannedCode {
-            id: codes.len(),
-            page,
-            kind: CodeKind::QrCode,
-            text,
-            rect: [0.0, 0.0, w as f64, h as f64],
-            pixel_size: [w as u32, h as u32],
-            image_index: None,
-        });
-    }
-}
-
-fn try_direct_grid_decode(binary: &BinaryImage) -> Option<String> {
-    let w = binary.width;
-    let h = binary.height;
-
-    for version in 1..=6 {
-        let size = version * 4 + 17;
-        let mod_w = (w as f32) / (size as f32);
-        let mod_h = (h as f32) / (size as f32);
-        if mod_w < 1.0 || mod_h < 1.0 {
-            continue;
-        }
-
-        let mut matches_finder = true;
-        for my in 0..7 {
-            for mx in 0..7 {
-                let expected_dark = (mx == 0 || mx == 6 || my == 0 || my == 6) || ((2..=4).contains(&mx) && (2..=4).contains(&my));
-                let sample_x = ((mx as f32 + 0.5) * mod_w) as usize;
-                let sample_y = ((my as f32 + 0.5) * mod_h) as usize;
-                if binary.is_dark(sample_x, sample_y) != expected_dark {
-                    matches_finder = false;
-                    break;
-                }
-            }
-            if !matches_finder {
-                break;
-            }
-        }
-
-        if matches_finder {
-            let mut modules = Vec::with_capacity(size * size);
-            for my in 0..size {
-                for mx in 0..size {
-                    let sample_x = (((mx as f32) + 0.5) * mod_w) as usize;
-                    let sample_y = (((my as f32) + 0.5) * mod_h) as usize;
-                    modules.push(binary.is_dark(sample_x, sample_y));
-                }
-            }
-            if let Some(decoded) = decode_qr_modules(&modules, size) {
-                return Some(decoded);
-            }
-        }
-    }
-    None
-}
-
-fn decode_qr_modules(modules: &[bool], size: usize) -> Option<String> {
-    let mut format_bits = 0u32;
-    for x in 0..=8 {
-        if x == 6 {
-            continue;
-        }
-        let bit = modules.get(8 * size + x).copied().unwrap_or(false);
-        format_bits = (format_bits << 1) | (u32::from(bit));
-    }
-    let mask = ((format_bits ^ 0x5412) >> 10) & 0x07;
-
-    let is_function = |x: usize, y: usize| -> bool {
-        if (x < 9 && y < 9) || (x >= size.saturating_sub(8) && y < 9) || (x < 9 && y >= size.saturating_sub(8)) {
-            return true;
-        }
-        if x == 6 || y == 6 {
-            return true;
-        }
-        if x == 8 && y == 4 * (size / 4) + 9 {
-            return true;
-        }
-        false
-    };
-
-    let mut bits = Vec::new();
-    let mut x = size.saturating_sub(1);
-    let mut going_up = true;
-
-    while x > 0 {
-        if x == 6 {
-            x = x.saturating_sub(1);
-        }
-        for step in 0..size {
-            let y = if going_up { size.saturating_sub(1).saturating_sub(step) } else { step };
-            for &col in &[x, x.saturating_sub(1)] {
-                if !is_function(col, y) {
-                    let mut dark = modules.get(y * size + col).copied().unwrap_or(false);
-                    if mask == 0 && (y + col) % 2 == 0 {
-                        dark = !dark;
-                    }
-                    bits.push(dark);
-                }
-            }
-        }
-        x = x.saturating_sub(2);
-        going_up = !going_up;
-    }
-
-    let mut bytes = Vec::with_capacity(bits.len() / 8);
-    for chunk in bits.as_chunks::<8>().0 {
-        let mut b = 0u8;
-        for &bit in chunk {
-            b = (b << 1) | u8::from(bit);
-        }
-        bytes.push(b);
-    }
-
-    if bytes.is_empty() {
-        return None;
-    }
-    let mode = (bytes[0] >> 4) & 0x0F;
-    if mode == 0x04 {
-        let count = (((bytes[0] & 0x0F) << 4) | (bytes.get(1).copied().unwrap_or(0) >> 4)) as usize;
-        let mut payload = Vec::with_capacity(count);
-        for i in 0..count {
-            let b1 = bytes.get(i + 1).copied().unwrap_or(0);
-            let b2 = bytes.get(i + 2).copied().unwrap_or(0);
-            let val = ((b1 & 0x0F) << 4) | (b2 >> 4);
-            payload.push(val);
-        }
-        if let Ok(text) = String::from_utf8(payload)
-            && !text.is_empty()
-        {
-            return Some(text);
-        }
-    }
-
-    None
-}
-
 /// Scan an arbitrary RGBA pixel buffer for embedded barcodes and QR codes.
 pub fn scan_rgba_buffer(width: usize, height: usize, rgba: &[u8], page: usize) -> Vec<ScannedCode> {
     let gray = match GrayImage::from_rgba(width, height, rgba) {
@@ -1060,11 +815,12 @@ pub fn scan_rgba_buffer(width: usize, height: usize, rgba: &[u8], page: usize) -
         }
     }
 
-    // Secondary Pass: Pure-Rust scanline / Otsu thresholding fallback ONLY if primary pass found no codes
+    // Secondary Pass: 1-D scanline / Otsu thresholding fallback ONLY if the primary pass found
+    // no codes. QR codes are left to rxing: the hand-rolled grid decoder could not verify a
+    // payload, so it is never reported.
     if codes.is_empty() {
         let binary = BinaryImage::from_gray(&gray);
         scan_1d_barcodes(&binary, &mut codes, page);
-        scan_qr_codes(&binary, &mut codes, page);
     }
 
     for (idx, c) in codes.iter_mut().enumerate() {
@@ -1213,10 +969,10 @@ impl Document {
                                 for sx in 0..total_samples {
                                     let x = rx0 + (sx * (rx1 - rx0)) / total_samples;
                                     let idx = (y * rw + x) * 4;
-                                    if let Some(slice) = rendered.rgba.get(idx..idx + 3) {
-                                        if slice[0] < 180 || slice[1] < 180 || slice[2] < 180 {
-                                            dark_count = dark_count.saturating_add(1);
-                                        }
+                                    if let Some(slice) = rendered.rgba.get(idx..idx + 3)
+                                        && (slice[0] < 180 || slice[1] < 180 || slice[2] < 180)
+                                    {
+                                        dark_count = dark_count.saturating_add(1);
                                     }
                                 }
                             }
@@ -1388,23 +1144,5 @@ mod tests {
         assert!(!scanned.is_empty(), "must detect generated QR code");
         assert_eq!(scanned[0].kind, CodeKind::QrCode);
         assert_eq!(scanned[0].text, payload);
-    }
-
-    #[test]
-    fn test_scan_user_sample() {
-        let path = r"C:\Users\sande\Desktop\sticker ES26270317.pdf";
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut session = crate::Session::new();
-            if let Ok(id) = session.open("sample.pdf", None, std::sync::Arc::new(bytes), None) {
-                let doc = session.get(id).unwrap();
-                for page in [0, 11] {
-                    let codes = doc.scan_page_codes(page);
-                    println!("Page {}: found {} codes:", page, codes.len());
-                    for c in &codes {
-                        println!("  - {:?}: '{}' rect: {:?}", c.kind, c.text, c.rect);
-                    }
-                }
-            }
-        }
     }
 }

@@ -218,27 +218,28 @@ impl SelectionLayoutEngine {
     }
 
     /// Render visual bounding box and selection handles for selected and hovered elements.
-    pub fn paint_selection_overlay(painter: &egui::Painter, xf: &PageXform, info: &DocInfo, state: &SelectionState) {
+    pub fn paint_selection_overlay(painter: &egui::Painter, page: usize, xf: &PageXform, info: &DocInfo, state: &SelectionState) {
+        if page >= info.pages.len() {
+            return;
+        }
         // Paint subtle hover outline if hovered element is distinct from selected.
         if let Some(hovered) = &state.hovered {
             let is_selected = state.selected.as_ref().is_some_and(|s| s.page == hovered.page && s.kind == hovered.kind && s.index == hovered.index);
-            if !is_selected && hovered.page < info.pages.len() {
+            if !is_selected && hovered.page == page {
                 let rect = hovered.screen_rect(xf, info).expand(2.0);
                 painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ACCENT_BLUE.gamma_multiply(0.4)), egui::StrokeKind::Outside);
             }
         }
 
         // Paint multi-selected elements if any.
-        for el in &state.multi_selected {
-            if el.page < info.pages.len() {
-                let rect = el.screen_rect(xf, info).expand(2.0);
-                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.25, ACCENT_BLUE.gamma_multiply(0.7)), egui::StrokeKind::Outside);
-            }
+        for el in state.multi_selected.iter().filter(|el| el.page == page) {
+            let rect = el.screen_rect(xf, info).expand(2.0);
+            painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.25, ACCENT_BLUE.gamma_multiply(0.7)), egui::StrokeKind::Outside);
         }
 
         // Paint primary selected element bounding box with 8 handles.
         if let Some(sel) = &state.selected {
-            if sel.page >= info.pages.len() {
+            if sel.page != page {
                 return;
             }
             let rect = sel.screen_rect(xf, info).expand(2.0);
@@ -426,17 +427,22 @@ impl FloatingContextMenu {
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
+                        let shortcut =
+                            |key: &'static str| crate::commands::shortcut_label(ui.ctx(), pdfcraft_engine::commands::Shortcut::cmd(key));
+                        let cut_tip = crate::i18n::fmt(tl!("Cut ({key})"), &[("key", &shortcut("X"))]);
+                        let copy_tip = crate::i18n::fmt(tl!("Copy ({key})"), &[("key", &shortcut("C"))]);
+                        let paste_tip = crate::i18n::fmt(tl!("Paste ({key})"), &[("key", &shortcut("V"))]);
                         ui.horizontal(|ui| {
                             // Cut (Ctrl+X)
-                            if can_modify && can_copy && crate::icons::button(ui, "scissors", 26.0, false, "Cut (Ctrl+X)").clicked() {
+                            if can_modify && can_copy && crate::icons::button(ui, "scissors", 26.0, false, &cut_tip).clicked() {
                                 action = Some(FloatingMenuAction::Cut);
                             }
                             // Copy (Ctrl+C)
-                            if can_copy && crate::icons::button(ui, "copy", 26.0, false, "Copy (Ctrl+C)").clicked() {
+                            if can_copy && crate::icons::button(ui, "copy", 26.0, false, &copy_tip).clicked() {
                                 action = Some(FloatingMenuAction::Copy);
                             }
                             // Paste (Ctrl+V)
-                            if can_modify && crate::icons::button(ui, "clipboard-paste", 26.0, false, "Paste (Ctrl+V)").clicked() {
+                            if can_modify && crate::icons::button(ui, "clipboard-paste", 26.0, false, &paste_tip).clicked() {
                                 action = Some(FloatingMenuAction::Paste);
                             }
 
@@ -448,7 +454,11 @@ impl FloatingContextMenu {
                                     "brush",
                                     26.0,
                                     has_format,
-                                    if has_format { "Apply formatting (Format Painter)" } else { "Pick up formatting (Format Painter)" },
+                                    if has_format {
+                                        tl!("Apply formatting (Format Painter)")
+                                    } else {
+                                        tl!("Pick up formatting (Format Painter)")
+                                    },
                                 )
                                 .clicked()
                                 {
@@ -457,7 +467,7 @@ impl FloatingContextMenu {
                             }
 
                             // Edit Text (for text elements)
-                            if is_text && can_modify && crate::icons::button(ui, "text-cursor-input", 26.0, false, "Edit text").clicked() {
+                            if is_text && can_modify && crate::icons::button(ui, "text-cursor-input", 26.0, false, tl!("Edit text")).clicked() {
                                 action = Some(FloatingMenuAction::EditText);
                             }
 
@@ -473,20 +483,20 @@ impl FloatingContextMenu {
                                 if crate::icons::button(ui, "strikethrough", 26.0, false, tl!("Strikethrough")).clicked() {
                                     action = Some(FloatingMenuAction::ToggleStrikethrough);
                                 }
-                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, "Insert symbol").clicked() {
+                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, tl!("Insert symbol")).clicked() {
                                     action = Some(FloatingMenuAction::OpenSymbolPalette);
                                 }
                             }
 
                             // Recognize Text (OCR for images)
-                            if is_image && can_modify && crate::icons::button(ui, "scan-text", 26.0, false, "Recognize text (OCR)").clicked() {
+                            if is_image && can_modify && crate::icons::button(ui, "scan-text", 26.0, false, tl!("Recognize text (OCR)")).clicked() {
                                 action = Some(FloatingMenuAction::RecognizeOcr);
                             }
 
                             // Separator before Delete
                             if can_modify {
                                 ui.separator();
-                                if crate::icons::button(ui, "trash-2", 26.0, false, "Delete (Del)").clicked() {
+                                if crate::icons::button(ui, "trash-2", 26.0, false, tl!("Delete (Del)")).clicked() {
                                     action = Some(FloatingMenuAction::Delete);
                                 }
                             }

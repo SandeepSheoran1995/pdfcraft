@@ -616,6 +616,8 @@ pub struct DocView {
     pub canvas_selection: crate::canvas_selection::SelectionState,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
+    /// A page scan running on a worker thread: `(document id, page, result)`.
+    pub(crate) barcode_scan: Option<(u64, usize, std::sync::mpsc::Receiver<Vec<pdfcraft_engine::barcode_scan::ScannedCode>>)>,
     /// A queued Fill & Sign signature: select it after its edit succeeds, then leave placement.
     pub(crate) fill_signature_page: Option<usize>,
     pub(crate) signature_drag: crate::signature_drag::SignatureDrag,
@@ -901,6 +903,7 @@ impl DocView {
             fill_text: None,
             canvas_selection: Default::default(),
             barcode_hud: Default::default(),
+            barcode_scan: None,
             fill_signature_page: None,
             signature_drag: Default::default(),
         }
@@ -947,7 +950,6 @@ impl DocView {
         fresh.rotation = self.rotation;
         fresh.current = self.current;
         fresh.organize = self.organize;
-        fresh.last_ready_page = self.last_ready_page;
         fresh.grid_zoom = self.grid_zoom;
         // Same document id, so the scroll offset egui keeps for it is still this document's.
         fresh.shown = self.shown;
@@ -1630,9 +1632,6 @@ impl DocView {
             );
         self.zoom = zoom;
         self.fit = Fit::None;
-        if zoom >= 1.25 && !self.continuous {
-            self.continuous = true;
-        }
         match anchor {
             Some(a) => self.zoom_anchor = Some(a),
             // Nothing on screen yet (e.g. a launch option): align the current page instead.
@@ -2423,9 +2422,12 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
     let key_pressed_fresh = |k| ctx.input(|i| i.key_pressed(k));
     let key_nav =
         |k| ctx.input(|i| i.key_pressed(k) || i.events.iter().any(|e| matches!(e, egui::Event::Key { key: pk, pressed: true, .. } if *pk == k)));
+    // The open barcode HUD steps through the page's codes with ← / →; it must not also turn
+    // the page and rescan, which would replace the list it is stepping through.
+    let hud_arrows = view.barcode_hud.open && view.barcode_hud.panel_open;
     if view.line_editor.is_none() {
         let mut did_step = false;
-        if key_nav(Key::ArrowRight) || (command && key_nav(Key::PageDown)) {
+        if !hud_arrows && (key_nav(Key::ArrowRight) || (command && key_nav(Key::PageDown))) {
             let is_fresh = key_pressed_fresh(Key::ArrowRight) || (command && key_pressed_fresh(Key::PageDown));
             if is_fresh || now - view.last_page_step >= 0.18 {
                 view.step_page(true);
@@ -2433,7 +2435,7 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
                 view.single_edges = None;
                 did_step = true;
             }
-        } else if key_nav(Key::ArrowLeft) || (command && key_nav(Key::PageUp)) {
+        } else if !hud_arrows && (key_nav(Key::ArrowLeft) || (command && key_nav(Key::PageUp))) {
             let is_fresh = key_pressed_fresh(Key::ArrowLeft) || (command && key_pressed_fresh(Key::PageUp));
             if is_fresh || now - view.last_page_step >= 0.18 {
                 view.step_page(false);
@@ -2504,6 +2506,18 @@ fn page_scroll<R>(
     draw: impl FnOnce(&mut egui::Ui, egui::Rect) -> R,
 ) -> egui::scroll_area::ScrollAreaOutput<R> {
     ui.scope_builder(egui::UiBuilder::new().id(id), |ui| scroll.show_viewport(ui, draw)).inner
+}
+
+/// Text on the system clipboard, for the floating menu's Paste. The web has no `arboard`
+/// dependency (and the browser owns the clipboard), so there is nothing to read there.
+#[cfg(not(target_arch = "wasm32"))]
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clipboard_text() -> Option<String> {
+    None
 }
 
 pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
@@ -2905,8 +2919,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         let target_y = view.single_page_target_y.unwrap_or(0.0);
         scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
         ui.ctx().request_repaint();
-    } else if !view.continuous {
-        let target_y = view.single_page_target_y.unwrap_or(0.0);
+    } else if !view.continuous
+        && let Some(target_y) = view.single_page_target_y
+    {
         scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
     }
     let ppp = ui.ctx().pixels_per_point();
@@ -3392,7 +3407,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             let image_owns_pointer = tool == QuickTool::EditText && crate::edit_text_ui::image_owns_pointer(ui, &xf, i, info, view);
             let on_objects =
                 !image_owns_pointer && tool == QuickTool::EditText && can_modify && crate::object_ui::page_input(ui, &resp, &xf, i, doc, view);
-            let lines = if matches!(tool, QuickTool::AddText | QuickTool::EditText) && can_modify {
+            let lines = if (matches!(tool, QuickTool::AddText | QuickTool::EditText) || (tool == QuickTool::Select && can_modify)) && can_modify {
                 let generation = doc.edit_generation();
                 match view.edit_lines.get(&i) {
                     Some((g, l)) if *g == generation => l.clone(),
@@ -3512,7 +3527,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 (matches!(tool, QuickTool::Select | QuickTool::Fill(_)) && !comments_hidden).then_some(view.comments.selected).flatten();
             view.signature_drag.prepare(ui.ctx(), doc, preview_target, scale);
             view.signature_drag.paint(painter, &pcx, &view.comments, view.pending_edit.as_ref());
-            crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(painter, &xf, info, &view.canvas_selection);
+            crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(painter, i, &xf, info, &view.canvas_selection);
 
             // Text layer: find matches, selection, I-beam and drag-to-select.
             let to_screen = |g: [f32; 4]| xf.view_rect(g);
@@ -4186,7 +4201,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 }
             }
             crate::canvas_selection::FloatingMenuAction::Paste => {
-                let clip_text = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+                let clip_text = clipboard_text();
                 if let Some(text) = clip_text
                     && let Some(sel) = &view.canvas_selection.selected
                 {
@@ -4297,19 +4312,22 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 }
             }
             crate::canvas_selection::FloatingMenuAction::ToggleStrikethrough => {
-                if let Some(sel) = &view.canvas_selection.selected {
-                    let text = sel.text.clone().unwrap_or_default();
-                    let strike_char = '\u{0336}';
-                    let toggled = if text.contains(strike_char) {
-                        text.replace(strike_char, "")
-                    } else {
-                        text.chars().flat_map(|c| if c.is_whitespace() { vec![c] } else { vec![c, strike_char] }).collect()
-                    };
-                    if sel.kind == crate::canvas_selection::SelectableKind::TextBlock {
-                        view.pending_edit = Some(Edit::EditTextBlock { page: sel.page, block: sel.index, text: toggled, style: Default::default() });
-                    } else if sel.kind == crate::canvas_selection::SelectableKind::TextLine {
-                        view.pending_edit = Some(Edit::EditTextLine { page: sel.page, line: sel.index, text: toggled });
-                    }
+                if let Some(sel) = &view.canvas_selection.selected
+                    && matches!(sel.kind, crate::canvas_selection::SelectableKind::TextBlock | crate::canvas_selection::SelectableKind::TextLine)
+                    && let Some(page_info) = info.pages.get(sel.page)
+                {
+                    // A StrikeOut annotation marks the text visually without rewriting it:
+                    // inserted U+0336 glyphs show as '?' and corrupt copy, search and export.
+                    view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                        page: sel.page,
+                        shape: pdfcraft_engine::Shape::TextMarkup {
+                            kind: comments::CommentTool::StrikeOut.markup().unwrap_or(pdfcraft_engine::Markup::StrikeOut),
+                            quads: vec![page_info.view_rect_to_quad(sel.user_rect.map(|v| v as f32))],
+                        },
+                        style: prefs.style(comments::CommentTool::StrikeOut),
+                        contents: String::new(),
+                        author: prefs.author.clone(),
+                    }));
                 }
             }
             crate::canvas_selection::FloatingMenuAction::OpenSymbolPalette => {
@@ -4342,7 +4360,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     // Barcode & QR Code Scanner HUD (Unified Single HUD)
     let now = ui.input(|i| i.time);
     let barcode_interactive = view.barcode_hud.open || app.quick_tool == QuickTool::QrBarcode;
-    crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, doc, now, barcode_interactive);
+    crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, doc, now, barcode_interactive, Some(ui.ctx()));
 
     if barcode_interactive {
         let current_page = view.current;
@@ -4389,7 +4407,6 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     view.barcode_hud.target_rect = Some(target_rect);
                     let codes = doc.scan_page_codes(current_page);
                     view.barcode_hud.update_codes_conditional(codes, true);
-                    view.barcode_hud.active_index = idx;
                     view.barcode_hud.edit_buffer = None;
                 }
             }
@@ -4678,26 +4695,10 @@ fn selection_actions(
             view.comments.composer = Some(comments::Composer { page, at, kind: comments::ComposerKind::Note, text: String::new(), focus: true });
         }
         SelectionAction::Replace => {
-            let mut target_box = None;
-            if !quads.is_empty() {
-                let mut min_x = f64::MAX;
-                let mut min_y = f64::MAX;
-                let mut max_x = f64::MIN;
-                let mut max_y = f64::MIN;
-                for q in &quads {
-                    min_x = min_x.min(q[0].min(q[6]));
-                    min_y = min_y.min(q[1].min(q[3]));
-                    max_x = max_x.max(q[2].max(q[4]));
-                    max_y = max_y.max(q[5].max(q[7]));
-                }
-                target_box = Some([min_x, min_y, max_x, max_y]);
-            }
-            let block_idx = if let (Some(tb), Some((_, lines))) = (target_box, view.edit_lines.get(&page)) {
-                lines.iter().position(|b| !(b.rect[2] < tb[0] || b.rect[0] > tb[2] || b.rect[3] < tb[1] || b.rect[1] > tb[3])).unwrap_or(0)
-            } else {
-                0
-            };
-            view.pending_text_open = Some((page, block_idx));
+            // Replace Text is a comment, so it stays available when the document may be
+            // annotated but not modified. The composer draws over the selected quads.
+            view.comments.replace = Some(quads);
+            view.comments.composer = Some(comments::Composer { page, at, kind: comments::ComposerKind::Replace, text: String::new(), focus: true });
             view.canvas_selection.clear();
             ui.ctx().request_repaint();
         }
@@ -5249,7 +5250,7 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                     // QR & Barcode Tools (Scanner & Generator)
                     if let Some((tab_idx, _)) = app.active_ids() {
                         let is_open = app.views.get(tab_idx).is_some_and(|v| v.barcode_hud.open);
-                        if icons::button(ui, "scan", 32.0, is_open, "QR & Barcode Tools").clicked()
+                        if icons::button(ui, "scan", 32.0, is_open, tl!("QR & Barcode Tools")).clicked()
                             && let Some(v) = app.views.get_mut(tab_idx)
                         {
                             v.barcode_hud.open = !v.barcode_hud.open;

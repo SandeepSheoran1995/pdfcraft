@@ -4,7 +4,7 @@
 > **Target:** Adobe Acrobat Pro offline parity (clean-room, Rust-native, cross-platform)  
 > **License:** MIT OR Apache-2.0 (Strict clean-room and open asset policies)  
 > **Current Stage:** Alpha (core workflows functional; ~67% feature breadth, ~50% ready for real work)  
-> **Status Last Updated:** 2026-10-17  
+> **Status Last Updated:** 2026-10-18  
 > **Active AI Operator:** Antigravity / Pair Programming Agent  
 
 ---
@@ -60,7 +60,7 @@ The codebase is organized as a strict layered architecture validated by `cargo x
 |   - redact (true sanitization)          - sign (PAdES, PKCS#7, CMS, LTV)              |
 |   - xfdf (FDF/XFDF import/export)       - forms (AcroForms, widgets, validation)      |
 |   - ocr (text recognition & layers)     - create (image/text -> PDF)                  |
-|   - export (Word, RTF, HTML, text)      - optimize (size reduction, streams)          |
+|   - export (Word, XLSX, RTF, HTML, text) - optimize (size reduction, streams)         |
 |   - preflight (PDF/A/X validation)      - a11y (accessibility checks)                 |
 |   - compare (document diffing)          - measure (calibrated 2D drawing)             |
 |   - print (composition & imposition)                                                  |
@@ -243,12 +243,12 @@ The codebase is organized as a strict layered architecture validated by `cargo x
 | **L3** | `js` | Sandboxed JavaScript runtime | Complete | Embedded Boa JS engine, Acrobat DOM subset, field event loops |
 | **L3** | `xfa` | Dynamic XML forms | Partial | XFA template parsing and basic data binding |
 | **L4** | `organize` | Page management | Complete | Rotate, delete, extract, split, combine, insert, reorder, crop, page labels |
-| **L4** | `edit` | Direct content editing | Active / Gap 3 | Latin paragraph reflow works; line selection, Enter reflow, font borrowing & QR codes planned |
+| **L4** | `edit` | Direct content editing | Active / Gap 3 | Latin paragraph reflow, font borrowing and QR codes work; line selection and Enter reflow planned |
 | **L4** | `redact` | True document redaction | Complete | Removes underlying text/image bytes from content stream + overlays black mark |
 | **L4** | `sign` | Digital signatures & validation | Active | PAdES / PKCS#7 signing, cert inspection; timestamp servers & LTV in progress |
 | **L4** | `xfdf` | Data exchange format | Complete | FDF and XFDF import/export for comments and forms; CSV/XML export |
 | **L4** | `create` | Document generation | Complete | Image to PDF, plain text to PDF, blank document creation |
-| **L4** | `export` | Format conversion | Partial | Image, text, RTF, HTML export; Word export functional but needs layout fidelity (#773) |
+| **L4** | `export` | Format conversion | Partial | Image, text, RTF, HTML, Word and XLSX export; layout fidelity still needs work (#773) |
 | **L4** | `optimize` | Document size reduction | Complete | Stream recompression, unused object removal, image downsampling |
 | **L4** | `ocr` | Optical character recognition | Active | Local neural OCR Latin engine; UI workflow and multi-page batching scheduled for Phase 6 |
 | **L4** | `preflight`| PDF standard verification | Partial | PDF/A verification partial; PDF/X and PDF/UA planned |
@@ -257,7 +257,7 @@ The codebase is organized as a strict layered architecture validated by `cargo x
 | **L4** | `measure` | Measurement tools | Complete | Distance, perimeter, area calculation with configurable scale ratio |
 | **L4** | `print` | Printing & imposition | Complete | System print spooler, N-up imposition, booklet layout |
 | **L6** | `engine` | Core Application Façade | Complete | `Session` tracking, 75+ `Edit` enum variants, undo/redo, command registry |
-| **L7** | `automation`| Headless tools & MCP | Complete | 140+ tools covering all operations, strict `--root` directory confinement; QR tool scheduled |
+| **L7** | `automation`| Headless tools & MCP | Complete | 140+ tools covering all operations, strict `--root` directory confinement; QR page insertion (`page_add_qr`) included |
 | **L7** | `ui-egui` | Desktop & Web UI Shell | Complete | Document viewport, toolbars, sidebar panels, KittTest control channel; Selection UX & Nav updating |
 | **L7** | `platform` | OS-specific bindings | Complete | File associations, clipboard, print spooling, native dialogs |
 | **Apps**| `apps/*` | Binaries (`pdfcraft`, CLI, web)| Complete | Native GUI, standalone CLI with runner & MCP server, WASM package |
@@ -294,7 +294,7 @@ The codebase is organized as a strict layered architecture validated by `cargo x
    - Translucent Acrobat-blue selection highlight (`rgba(20, 115, 230, 80)`), eliminating dark selection boxes.
    - Strict formatting & spacing lock: existing font metrics, `Tw`, `TL`, `Tc`, and paragraph geometry remain completely undisturbed.
    - Rich Text & Formatting Toolkit: Format Painter (pick up and apply formatting across elements), Auto Font Detection & Borrowing (embedded sfnt harvesting and metric fallback), Text Styles (bold, italic, strikethrough, superscript, subscript), and Categorized Symbol Insertion Palette (©, ®, ™, §, ¶, •, —, –, ±, ≠, ≤, ≥, °, €, £, ¥, fractions, subscripts).
-7. **[x] Phase 4 — Advanced QR & Barcode Scanner HUD [COMPLETE]**:
+7. **[x] Phase 2.4 — Advanced QR & Barcode Scanner HUD [COMPLETE]**:
    - Multi-format code detection & scanning (QR codes, Code 128, Code 39) across page images.
    - Interactive floating HUD popup anchored to detected codes with scanned text readout.
    - Copy Scanned Text and Edit action buttons.
@@ -613,7 +613,7 @@ The repository issues backlog has been thoroughly audited and structured into 6 
     - Fixed subpixel anti-aliasing issue on thin vector lines by rendering Pass 2 at crisp integer `scale = 2.0f32` (144 DPI) with fallback to `1.0f32`.
     - Added vertical bar transition analysis to capture the full physical height of 1D linear barcodes.
     - Implemented cross-pass spatial and payload deduplication to prevent duplicate HUD entries.
-    - Verified against user's actual shipping label (`sticker ES26270317.pdf`) — detecting all 10 barcodes and QR codes with 100% precision.
+    - Verified against the sample shipping label (`sticker ES26270317.pdf`) — detecting every barcode and QR code it contains, with no false positives (page and symbology counts in the 2026-10-18 run below).
   - `crates/engine/src/qr.rs`:
     - Migrated QR encoding from fragile custom version tables to pure-Rust `rxing::qrcode::QRCodeWriter` with ISO/IEC 18004 compliance.
     - Preserved 4-module quiet zone invariants across PNG and PDF vector exports (`re ... f`).
@@ -633,7 +633,7 @@ The repository issues backlog has been thoroughly audited and structured into 6 
     - Filtered out `UPC_E` false positives that triggered on text lines/borders.
     - Restricted secondary pure-Rust scanline pass to run only when the primary rxing pass detects zero codes.
     - Implemented horizontal scanline extent tracing across the full barcode width, accurately capturing bounds for all barcodes.
-    - Verified against user's actual shipping label (`sticker ES26270317.pdf`): detected **exactly 8 barcodes** on both page 0 and page 11 (0 false positives).
+    - Verified against the sample shipping label (`sticker ES26270317.pdf`): detected **exactly 8 barcodes** on each of pages 0 and 11, and no QR codes there (0 false positives).
     - Overhauled `Document::generate_replacement_code` to use `rxing::MultiFormatWriter`, producing 100% standards-compliant Code 39, Code 128, and QR codes that scan immediately on re-inspection.
   - `crates/ui-egui/src/barcode_hud.rs` & `crates/ui-egui/src/canvas.rs`:
     - Eliminated the redundant second popup/tall side panel in favor of a single unified compact HUD card (330px width).
@@ -641,7 +641,7 @@ The repository issues backlog has been thoroughly audited and structured into 6 
     - Highlighted active barcode on canvas with exact user specification: **0.5px blue bounding box** (`Stroke::new(0.5, Color32::from_rgb(0x3B, 0x82, 0xF6))`) and **very slight light blue fill** (`Color32::from_rgba_unmultiplied(0x3B, 0x82, 0xF6, 25)`).
     - Other detected barcodes on the page show a faint 0.5px outline with no fill.
     - Includes collapsible `Generate New QR Code` input at the bottom of the HUD.
-- **Verification**:
+
 ### Log Entry — 2026-10-18: 1D Barcode Exact Edge Tracing, QR Top-Clipping Fix & Engine Hardening
 - **Action/Task**: Fixed 1D barcode misalignment and 2D QR code top clipping on real shipping labels, hardened engine scanner against malformed PDFs and large pages, and cleaned up UI canvas selection logic and clippy warnings.
 - **Architectural Deliverables**:

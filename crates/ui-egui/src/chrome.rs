@@ -708,7 +708,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     let next = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
                     view.set_fit(next);
                 }
-                let bg_tip = format!("Page background: {} (click to cycle)", bg_mode.label());
+                let bg_tip = crate::i18n::fmt(tl!("Page background: {mode} (click to cycle)"), &[("mode", tl!(bg_mode.label()))]);
                 let bg_active = bg_mode != PageBackground::Default;
                 if icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip).clicked() {
                     cycle_bg = true;
@@ -853,7 +853,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                                     Stroke::new(1.0, Color32::from_gray(100))
                                 };
                                 ui.painter().rect(rect, CornerRadius::same(4), color, stroke, egui::StrokeKind::Inside);
-                                if resp.on_hover_text(name).clicked() {
+                                if resp.on_hover_text(tl!(name)).clicked() {
                                     reading_bg.color = color;
                                     if reading_bg.mode == PageBackground::Default {
                                         reading_bg.mode = PageBackground::Dark;

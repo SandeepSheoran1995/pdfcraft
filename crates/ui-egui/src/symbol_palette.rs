@@ -48,12 +48,12 @@ impl SymbolPalette {
                 .show(ui, |ui| {
                     ui.set_width(280.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Insert Symbol").font(crate::theme::semibold(13.0)));
+                        ui.label(egui::RichText::new(tl!("Insert Symbol")).font(crate::theme::semibold(13.0)));
                     });
                     ui.add_space(6.0);
 
                     for cat in SYMBOL_CATEGORIES {
-                        ui.label(egui::RichText::new(cat.name).font(crate::theme::medium(11.0)).color(t.text_muted));
+                        ui.label(egui::RichText::new(tl!(cat.name)).font(crate::theme::medium(11.0)).color(t.text_muted));
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::splat(3.0);
                             for &sym in cat.symbols {

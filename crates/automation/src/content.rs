@@ -133,6 +133,9 @@ impl Automation {
         let page = self.page(a)?;
         let ph = self.doc(a)?.info.pages.get(page).map(|p| p.height as f64).ok_or_else(|| bad("the page no longer exists"))?;
         let text = a.str("text")?;
+        if text.trim().is_empty() {
+            return Err(bad("text must not be empty"));
+        }
         let rect = rect_arg(a, "rect")?.map(|r| to_display(r, ph));
         let matrix = pdfcraft_engine::qr::QrCode::encode_text(text).map_err(|e| failed(e.to_string()))?;
         let png_bytes = matrix.to_png_bytes(8, 2).map_err(|e| failed(e.to_string()))?;
@@ -141,7 +144,8 @@ impl Automation {
         let mine: Vec<_> = doc.added().iter().filter(|x| x.page == page).collect();
         out["index"] = json!(mine.len());
         out["rect"] = json!(mine.last().map(|x| to_view(x.content.rect(), ph)));
-        out["qr_version"] = json!(matrix.size);
+        out["qr_version"] = json!(matrix.size.saturating_sub(17) / 4);
+        out["qr_modules"] = json!(matrix.size);
         Ok(out)
     }
 

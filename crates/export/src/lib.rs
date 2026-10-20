@@ -354,10 +354,35 @@ fn items(pages: &[Page]) -> Vec<Item<'_>> {
             .collect();
 
         let is_multi_column = if p.width > 300.0 && non_table_blocks.len() >= 6 {
-            let left_count = non_table_blocks.iter().filter(|b| b.rect[2] <= mid_x + 15.0).count();
-            let right_count = non_table_blocks.iter().filter(|b| b.rect[0] >= mid_x - 15.0).count();
+            let left: Vec<&Block> = non_table_blocks.iter().copied().filter(|b| b.rect[2] <= mid_x + 15.0).collect();
+            let right: Vec<&Block> = non_table_blocks.iter().copied().filter(|b| b.rect[0] >= mid_x - 15.0).collect();
             let cross_count = non_table_blocks.iter().filter(|b| b.rect[0] < mid_x - 15.0 && b.rect[2] > mid_x + 15.0).count();
-            left_count >= 3 && right_count >= 3 && cross_count <= 2
+            // A paragraph-sized block, rather than a label or a value.
+            let paragraph = |b: &Block| b.rect[2] - b.rect[0] >= p.width * 0.18;
+            // Real columns run side by side over the same vertical span...
+            let extent =
+                |v: &[&Block]| v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), b| (lo.min(b.rect[1]), hi.max(b.rect[3])));
+            let (left_lo, left_hi) = extent(&left);
+            let (right_lo, right_hi) = extent(&right);
+            let (overlap, shortest) = if left.is_empty() || right.is_empty() {
+                (0.0, 0.0)
+            } else {
+                (
+                    (left_hi.min(right_hi) - left_lo.max(right_lo)).max(0.0),
+                    (left_hi - left_lo).min(right_hi - right_lo),
+                )
+            };
+            // ... whereas a label/value form pairs each left block with a right block on the same
+            // baseline. Text that is paired row by row is not two columns.
+            let paired = left.iter().filter(|l| right.iter().any(|r| (l.rect[3] - r.rect[3]).abs() <= 6.0)).count();
+            left.len() >= 3
+                && right.len() >= 3
+                && cross_count <= 2
+                && left.iter().filter(|b| paragraph(b)).count() >= 2
+                && right.iter().filter(|b| paragraph(b)).count() >= 2
+                && shortest > 0.0
+                && overlap >= shortest * 0.5
+                && paired * 2 < left.len()
         } else {
             false
         };
@@ -542,13 +567,15 @@ fn docx_table(t: &Table) -> String {
     edges.push(t.rect[2]);
     let widths: Vec<i64> = edges.windows(2).map(|w| ((w[1] - w[0]).max(20.0) * 20.0).round().clamp(60.0, 31680.0) as i64).collect();
     let mut s = String::from("<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>");
-    // Explicit cell margins (padding): top 100dxa (5pt), left 140dxa (7pt), bottom 100dxa (5pt), right 140dxa (7pt)
-    s.push_str("<w:tblCellMar><w:top w:w=\"100\" w:type=\"dxa\"/><w:left w:w=\"140\" w:type=\"dxa\"/><w:bottom w:w=\"100\" w:type=\"dxa\"/><w:right w:w=\"140\" w:type=\"dxa\"/></w:tblCellMar>");
     s.push_str("<w:tblBorders>");
     for edge in ["top", "left", "bottom", "right", "insideH", "insideV"] {
         s.push_str(&format!("<w:{edge} w:val=\"nil\"/>"));
     }
-    s.push_str("</w:tblBorders></w:tblPr><w:tblGrid>");
+    s.push_str("</w:tblBorders>");
+    // Explicit cell margins (padding): top 100dxa (5pt), left 140dxa (7pt), bottom 100dxa (5pt), right 140dxa (7pt).
+    // CT_TblPr orders tblCellMar after tblBorders; Word treats the file as corrupt otherwise.
+    s.push_str("<w:tblCellMar><w:top w:w=\"100\" w:type=\"dxa\"/><w:left w:w=\"140\" w:type=\"dxa\"/><w:bottom w:w=\"100\" w:type=\"dxa\"/><w:right w:w=\"140\" w:type=\"dxa\"/></w:tblCellMar>");
+    s.push_str("</w:tblPr><w:tblGrid>");
     for w in &widths {
         s.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
     }

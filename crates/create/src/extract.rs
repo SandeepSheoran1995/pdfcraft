@@ -126,14 +126,8 @@ fn image(doc: &Document, s: &Stream) -> Result<(&'static str, Vec<u8>), String> 
     // A stencil mask (`ImageMask true`) has no /SMask or /Mask of its own (8.9.6.2).
     let mut alpha = if mask { None } else { soft_mask(doc, s, w, h).or_else(|| stencil_mask(doc, s, w, h)) };
     let key = if mask { None } else { colour_key(doc, s) };
-    if !mask {
-        let has_smask = s.dict.get(b"SMask").map(|m| doc.resolve(m)).is_some_and(|m| matches!(&*m, Object::Stream(..) | Object::Ref(..)));
-        let has_stream_mask =
-            s.dict.get(b"Mask").map(|m| doc.resolve(m)).is_some_and(|m| matches!(&*m, Object::Stream(..) | Object::Ref(..)) && key.is_none());
-        if (has_smask || has_stream_mask) && alpha.is_none() {
-            return Err("the image has a mask that cannot be decoded".into());
-        }
-    }
+    // A mask that cannot be decoded is dropped: the image exports without transparency, rather
+    // than failing the whole page.
     // Keep the existing JPEG and stencil-mask Decode handling separate from lossless colour images.
     // Decode arrays: only inversion ([1 0] per component) is honoured, the common case.
     let inverted = (jpeg || mask)

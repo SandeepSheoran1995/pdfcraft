@@ -10,8 +10,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum QrError {
-    #[error("text payload is too large for supported QR versions (max 134 bytes)")]
-    PayloadTooLarge,
+    #[error("the text can't be encoded as a QR code: {0}")]
+    Encoding(String),
     #[error("failed to encode PNG: {0}")]
     PngEncoding(String),
 }
@@ -123,14 +123,14 @@ impl QrCode {
     /// Encode a text or URL payload into a `QrMatrix` using standard QR code encoding.
     pub fn encode_text(text: &str) -> Result<QrMatrix, QrError> {
         let writer = rxing::qrcode::QRCodeWriter;
-        let matrix = writer.encode(text, &rxing::BarcodeFormat::QR_CODE, 0, 0).map_err(|e| QrError::PngEncoding(e.to_string()))?;
+        let matrix = writer.encode(text, &rxing::BarcodeFormat::QR_CODE, 0, 0).map_err(|e| QrError::Encoding(e.to_string()))?;
 
         let total_w = matrix.getWidth() as usize;
         // rxing adds a default 4-module quiet zone margin on each side (total 8 modules).
         // Extract the core matrix so `QrMatrix` has standard module dimensions.
         let core_size = total_w.saturating_sub(8);
         if core_size == 0 {
-            return Err(QrError::PngEncoding("Failed to generate valid QR matrix".into()));
+            return Err(QrError::Encoding("the encoder returned an empty matrix".into()));
         }
 
         let mut qr_matrix = QrMatrix::new(core_size);

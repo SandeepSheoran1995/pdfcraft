@@ -326,7 +326,6 @@ fn color32(color: [f64; 3]) -> Color32 {
 }
 
 /// The dark box behind text too pale to read on white.
-#[allow(dead_code)]
 const DARK_EDITOR_FILL: Color32 = Color32::from_gray(0x26);
 
 /// WCAG relative luminance of an sRGB colour.
@@ -339,14 +338,12 @@ fn luminance(c: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio between two colours (1 to 21).
-#[allow(dead_code)]
 fn contrast(a: Color32, b: Color32) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 /// The inline editor's fallback contrast calculator for text drawn in `text`.
-#[allow(dead_code)]
 pub(crate) fn editor_fill(text: Color32) -> Color32 {
     if contrast(text, Color32::WHITE) >= contrast(text, DARK_EDITOR_FILL) { Color32::WHITE } else { DARK_EDITOR_FILL }
 }
@@ -1370,18 +1367,22 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             }
-            // Zero unnatural black background highlights: editing is completely transparent and natural directly on the canvas.
-            let fill = Color32::TRANSPARENT;
+            // Editing is transparent directly on the canvas. Until the textless backdrop is
+            // ready, a wash stands in for it, sized to the draft (`ed.overflow`) rather than just
+            // the source box; the caret then contrasts with that wash, as it does with the page.
+            let wash_rect = if ed.overflow { live } else { ed.rect };
+            let editor_backdrop = if background_ready { Color32::TRANSPARENT } else { editor_fill(text_color) };
             if !background_ready {
-                // If background preview is still rendering, subtle white wash for dark text, never black
-                if luminance(text_color) < 0.2 {
-                    ui.painter().rect_filled(ed.rect.expand(1.0), CornerRadius::ZERO, Color32::from_white_alpha(230));
-                }
+                ui.painter().rect_filled(wash_rect.expand(1.0), CornerRadius::ZERO, editor_backdrop);
             }
-            egui::Frame::NONE.fill(fill).show(ui, |ui| {
+            egui::Frame::NONE.fill(Color32::TRANSPARENT).show(ui, |ui| {
                 // Translucent Acrobat-blue selection highlight, zero black selection boxes
                 ui.visuals_mut().selection.bg_fill = Color32::from_rgba_unmultiplied(0x14, 0x73, 0xE6, 80);
-                ui.visuals_mut().text_cursor.stroke.color = if luminance(text_color) < 0.5 { Color32::BLACK } else { Color32::WHITE };
+                ui.visuals_mut().text_cursor.stroke.color = if background_ready {
+                    if luminance(text_color) < 0.5 { Color32::BLACK } else { Color32::WHITE }
+                } else {
+                    caret_color_on(editor_backdrop)
+                };
                 let rows = 1;
                 let snapshot = ed.clone();
                 let mut layouter =

@@ -28,11 +28,30 @@ pub fn col_name(mut col: usize) -> String {
     s.chars().rev().collect()
 }
 
-/// Checks if a string represents a numeric value (e.g. "123", "$45.67", "1,234.50", "98%").
-/// Returns the parsed f64 if valid.
+/// Checks if a string represents a numeric value (e.g. "123", "$45.67", "1,234.50").
+/// Returns the parsed f64 if valid. Conservative: a value that would change is left as text.
 pub fn parse_numeric(s: &str) -> Option<f64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    // A percentage would be written as 45.00, not 45 %: keep the source text.
+    if trimmed.contains('%') {
+        return None;
+    }
+    let unsigned = trimmed.trim_start_matches(['+', '-', '$', '€', '£', '¥']);
+    // Identifiers (ZIP codes, part numbers) keep their leading zero, and f64 cannot hold
+    // more than 15 exact digits: both stay text.
+    if unsigned.chars().filter(char::is_ascii_digit).count() > 15
+        || (unsigned.len() > 1 && unsigned.starts_with('0') && !unsigned.starts_with("0."))
+    {
+        return None;
+    }
+    // A comma is a thousands separator only in groups of three ("1,234.50", not "1,5").
+    if let Some(int_part) = unsigned.split('.').next()
+        && int_part.contains(',')
+        && !int_part.split(',').skip(1).all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()))
+    {
         return None;
     }
     // Clean currency and percentage signs
@@ -78,7 +97,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
 
     let mut sheets: Vec<String> = Vec::new();
 
-    for p in pages.iter() {
+    for (page_index, p) in pages.iter().enumerate() {
         let (tables, consumed) = crate::tables(&p.blocks);
         let mut rows: Vec<XlsxRow> = Vec::new();
         let mut merges: Vec<String> = Vec::new();
@@ -230,11 +249,14 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
             merge_xml.push_str("</mergeCells>");
         }
 
+        // Only the first sheet is selected; marking every sheet selected opens Excel in
+        // group mode, where an edit applies to every page sheet at once.
+        let selected = if page_index == 0 { " tabSelected=\"1\"" } else { "" };
         let sheet_xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews>\
+<sheetViews><sheetView{selected} workbookViewId=\"0\"/></sheetViews>\
 <sheetFormatPr defaultRowHeight=\"20\"/>\
 {cols_xml}\
 <sheetData>{sheet_data}</sheetData>\
@@ -371,7 +393,11 @@ mod tests {
         assert_eq!(parse_numeric("123"), Some(123.0));
         assert_eq!(parse_numeric("  $1,234.56  "), Some(1234.56));
         assert_eq!(parse_numeric("€99.95"), Some(99.95));
-        assert_eq!(parse_numeric("45%"), Some(45.0));
+        assert_eq!(parse_numeric("45%"), None);
+        assert_eq!(parse_numeric("02134"), None);
+        assert_eq!(parse_numeric("1,5"), None);
+        assert_eq!(parse_numeric("555,1234"), None);
+        assert_eq!(parse_numeric("1234567890123456"), None);
         assert_eq!(parse_numeric("NotANumber"), None);
         assert_eq!(parse_numeric(""), None);
     }
