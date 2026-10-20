@@ -2915,14 +2915,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 scroll = scroll.horizontal_scroll_offset(target.clamp(0.0, (content_w - w).max(0.0)));
             }
         }
-    } else if !texture_ready && !view.continuous && view.single_page_target_y.is_some() {
-        let target_y = view.single_page_target_y.unwrap_or(0.0);
+    } else if !view.continuous && let Some(target_y) = view.single_page_target_y {
         scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
-        ui.ctx().request_repaint();
-    } else if !view.continuous
-        && let Some(target_y) = view.single_page_target_y
-    {
-        scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
+        if !texture_ready {
+            ui.ctx().request_repaint();
+        }
     }
     let ppp = ui.ctx().pixels_per_point();
     let scale = view.render_scale(ppp);
@@ -4413,7 +4410,6 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     // Clicking a barcode focuses it, rescans with tight bounds, and opens HUD
                     view.barcode_hud.open = true;
                     view.barcode_hud.panel_open = true;
-                    view.barcode_hud.active_index = idx;
                     view.barcode_hud.target_rect = Some(target_rect);
                     let codes = doc.scan_page_codes(current_page);
                     view.barcode_hud.update_codes_conditional(codes, true);
