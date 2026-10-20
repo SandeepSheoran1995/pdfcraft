@@ -101,7 +101,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
         for b in header_blocks {
             if let Some(group) = line_groups.last_mut()
                 && let Some(first) = group.first()
-                && (first.rect[1] - b.rect[1]).abs() <= 6.0
+                && (first.rect[3] - b.rect[3]).abs() <= 6.0
             {
                 group.push(b);
                 continue;

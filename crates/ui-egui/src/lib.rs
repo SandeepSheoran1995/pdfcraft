@@ -1129,7 +1129,13 @@ impl PdfCraftApp {
             M::Default => {}
             M::ActualSize => view.set_zoom(1.0),
             M::Percent(p) => view.set_zoom((p / 100.0) as f32),
-            M::FitPage | M::FitVisible => view.set_fit(canvas::Fit::Page),
+            // `set_fit` also picks a continuous mode for the zoom; a PDF that asked for its own
+            // page layout keeps it, as Acrobat does, so only the zoom is taken from here then.
+            M::FitPage | M::FitVisible => {
+                if matches!(v.layout, L::Default) {
+                    view.set_fit(canvas::Fit::Page);
+                }
+            }
             M::FitWidth => view.set_fit(canvas::Fit::Width),
             M::FitHeight => view.set_fit(canvas::Fit::Height),
         }

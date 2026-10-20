@@ -183,8 +183,11 @@ impl BarcodeScannerHud {
     /// Reactive Auto-Page Tracking hook:
     ///
     /// Scans current page on page change so interactive canvas clicks work immediately.
-    /// Only displays feedback toasts if the user has the HUD open.
+    /// Only runs while the HUD is open, since barcode hit areas are interactive only then.
     pub fn auto_scan_on_page_change(view: &mut DocView, doc: &Document, now: f64) {
+        if !view.barcode_hud.open {
+            return;
+        }
         let current_page = view.current;
         if view.barcode_hud.last_scanned_page != Some(current_page) {
             view.barcode_hud.last_scanned_page = Some(current_page);
@@ -271,12 +274,15 @@ impl BarcodeScannerHud {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        if ui
-                                            .add(egui::Button::new(
-                                                egui::RichText::new("🗑 Delete").font(theme::medium(11.0)).color(Color32::from_rgb(0xEF, 0x44, 0x44)),
-                                            ))
-                                            .on_hover_text("Delete barcode and whiteout region")
-                                            .clicked()
+                                        if can_modify
+                                            && ui
+                                                .add(egui::Button::new(
+                                                    egui::RichText::new("🗑 Delete")
+                                                        .font(theme::medium(11.0))
+                                                        .color(Color32::from_rgb(0xEF, 0x44, 0x44)),
+                                                ))
+                                                .on_hover_text("Delete barcode and whiteout region")
+                                                .clicked()
                                         {
                                             delete_code = Some(active.clone());
                                         }
@@ -598,7 +604,19 @@ impl BarcodeScannerHud {
             match Document::generate_replacement_code(active.kind, &active.text, pw, ph) {
                 Ok(png_bytes) => {
                     let kind_name = format!("{:?}", active.kind).to_ascii_lowercase();
-                    let filename = format!("barcode_{}_{}.png", kind_name, (now as u64) % 10000);
+                    let filename = {
+                        let mut n = 0u64;
+                        loop {
+                            let name = format!("barcode_{}_{}_{}.png", kind_name, (now as u64) % 10000, n);
+                            if !get_downloads_dir().join(&name).exists() {
+                                break name;
+                            }
+                            n = n.saturating_add(1);
+                            if n > 1000 {
+                                break format!("barcode_{}_{}.png", kind_name, now as u64);
+                            }
+                        }
+                    };
                     #[cfg(target_arch = "wasm32")]
                     {
                         let _ = crate::editing::download(&filename, &png_bytes);

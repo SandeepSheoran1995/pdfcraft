@@ -2752,7 +2752,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         line_base.y = 0.0;
         boost_extra.y = 0.0;
     }
-    let texture_ready = view.pages.contains_key(&view.current);
+    let texture_ready = view.pages.contains_key(&view.current) || view.errors.contains_key(&view.current);
     if !texture_ready {
         ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
         precise_scroll = Vec2::ZERO;
@@ -2901,7 +2901,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 scroll = scroll.horizontal_scroll_offset(target.clamp(0.0, (content_w - w).max(0.0)));
             }
         }
-    } else if !texture_ready {
+    } else if !texture_ready && !view.continuous && view.single_page_target_y.is_some() {
         let target_y = view.single_page_target_y.unwrap_or(0.0);
         scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
         ui.ctx().request_repaint();
@@ -3169,7 +3169,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     }
                 } else if let Some(thumb) = view.thumbs.get(&i) {
                     xf.paint_image(painter, thumb.tex.id(), 0.0, 0.0, 1.0, 1.0);
-                } else if let Some(prev) = view.last_ready_page.and_then(|prev_idx| view.pages.get(&prev_idx)) {
+                } else if !view.continuous
+                    && let Some(prev) = view.last_ready_page.and_then(|prev_idx| view.pages.get(&prev_idx))
+                {
                     // Prevent white flash: continue rendering previous page's ready texture over new page's area
                     xf.paint_image(painter, prev.tex.id(), 0.0, 0.0, 1.0, 1.0);
                 } else {
@@ -4340,7 +4342,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     let now = ui.input(|i| i.time);
     crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, doc, now);
 
-    let barcode_interactive = view.barcode_hud.open || app.quick_tool == QuickTool::Select;
+    let barcode_interactive = view.barcode_hud.open;
     if barcode_interactive {
         let current_page = view.current;
         if let Some(xf) = view.page_xform(current_page) {

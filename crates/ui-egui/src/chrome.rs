@@ -805,6 +805,12 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             });
             if cycle_bg {
                 app.reading_bg.mode = app.reading_bg.mode.next();
+                // A preset carries its own tint; the manual picker below still overrides it.
+                app.reading_bg.color = match app.reading_bg.mode {
+                    PageBackground::Light => Color32::from_rgb(0xF5, 0xF2, 0xEB),
+                    PageBackground::Dark => Color32::from_rgb(0x1E, 0x1E, 0x1E),
+                    PageBackground::Default => app.reading_bg.color,
+                };
             }
             if toggle_picker {
                 app.reading_bg.picker_open = !app.reading_bg.picker_open;
