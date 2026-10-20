@@ -187,6 +187,19 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
     }
     // Edit a PDF shows Format text at the top while text is selected or being added.
     if g.id == "edit" {
+        if let Some(i) = app.active {
+            if let Some(view) = app.views.get_mut(i) {
+                ui.horizontal(|ui| {
+                    if widgets::pill_button(ui, tl!("Vector Edit"), view.vector_edit_mode)
+                        .on_hover_text(tl!("Toggle vector line editing mode"))
+                        .clicked()
+                    {
+                        view.vector_edit_mode = !view.vector_edit_mode;
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        }
         if app.quick_tool == crate::QuickTool::EditText {
             let count = app.active_ids().map_or(0, |(i, _)| app.views[i].objects.count());
             if count > 0 {

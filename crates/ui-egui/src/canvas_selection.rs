@@ -6,13 +6,17 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use egui::{Color32, CornerRadius, CursorIcon, Key, Pos2, Rect, Stroke, vec2};
-use pdfcraft_engine::{Edit, ImageEdit};
+use pdfcraft_engine::{Edit, ImageEdit, LineSegment};
 use pdfcraft_render::DocInfo;
 
 use crate::canvas::{DocView, Fit, PageXform};
 
 /// Primary selection accent color (Acrobat-style blue).
 pub const ACCENT_BLUE: Color32 = Color32::from_rgb(0x14, 0x73, 0xE6);
+
+/// Hover accent (amber) — shown when the pointer is over an element but it
+/// is not selected. ACCENT_BLUE is used for the selected state.
+pub const ACCENT_YELLOW: Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);
 
 /// The kind of selectable canvas element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +29,8 @@ pub enum SelectableKind {
     Image,
     /// Added vector/text content stream.
     AddedContent,
+    /// Stroked vector line segment.
+    VectorLine,
 }
 
 /// An identified element on a page with its bounding box in PDF user space.
@@ -42,22 +48,38 @@ pub struct SelectableElement {
     pub text: Option<String>,
     /// Source baseline coordinates `[x, y]` if a text element.
     pub baseline: Option<[f64; 2]>,
+    /// If `kind == VectorLine`, the line geometry (None otherwise).
+    pub line: Option<LineSegment>,
 }
 
 impl SelectableElement {
     /// Construct a selectable text line element.
     pub fn new_line(page: usize, index: usize, user_rect: [f64; 4], text: String, baseline: Option<[f64; 2]>) -> Self {
-        Self { page, kind: SelectableKind::TextLine, index, user_rect, text: Some(text), baseline }
+        Self { page, kind: SelectableKind::TextLine, index, user_rect, text: Some(text), baseline, line: None }
     }
 
     /// Construct a selectable text block element.
     pub fn new_block(page: usize, index: usize, user_rect: [f64; 4], text: String) -> Self {
-        Self { page, kind: SelectableKind::TextBlock, index, user_rect, text: Some(text), baseline: None }
+        Self { page, kind: SelectableKind::TextBlock, index, user_rect, text: Some(text), baseline: None, line: None }
     }
 
     /// Construct a selectable image element.
     pub fn new_image(page: usize, index: usize, user_rect: [f64; 4]) -> Self {
-        Self { page, kind: SelectableKind::Image, index, user_rect, text: None, baseline: None }
+        Self { page, kind: SelectableKind::Image, index, user_rect, text: None, baseline: None, line: None }
+    }
+
+    /// Construct a selectable vector-line element.
+    pub fn new_line_vector(page: usize, line: LineSegment) -> Self {
+        let bbox = line.bbox();
+        Self {
+            page,
+            kind: SelectableKind::VectorLine,
+            index: line.index,
+            user_rect: bbox,
+            text: None,
+            baseline: None,
+            line: Some(line),
+        }
     }
 
     /// Transform the user-space bounding box to screen coordinates.
@@ -271,6 +293,7 @@ impl SelectionLayoutEngine {
             SelectableKind::TextBlock => Some(Edit::EditTextBlock { page: el.page, block: el.index, text: String::new(), style: Default::default() }),
             SelectableKind::Image => Some(Edit::EditPageImage { page: el.page, index: el.index, change: ImageEdit::Delete }),
             SelectableKind::AddedContent => Some(Edit::DeleteContent { page: el.page, index: el.index }),
+            SelectableKind::VectorLine => None,
         }
     }
 
@@ -386,7 +409,7 @@ impl SelectionLayoutEngine {
                             text: sel.text.clone().unwrap_or_default(),
                         });
                     }
-                    SelectableKind::AddedContent => {}
+                    SelectableKind::AddedContent | SelectableKind::VectorLine => {}
                 }
                 state.active_handle = None;
             }
@@ -645,6 +668,72 @@ impl FloatingContextMenu {
 
         action
     }
+}
+
+// ─── Vector line highlights ────────────────────────────────────────────────
+
+/// Which highlight state a line segment is currently in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineHighlightState {
+    Hover,
+    Selected,
+}
+
+impl LineHighlightState {
+    /// Colour used for this state.
+    pub fn color(self) -> Color32 {
+        match self {
+            Self::Hover => ACCENT_YELLOW,
+            Self::Selected => ACCENT_BLUE,
+        }
+    }
+}
+
+/// Hit-test a single line segment against a screen-space position.
+///
+/// `tolerance` is the pick radius in screen pixels, typically 4–6.
+pub fn hit_test_line(
+    pos: Pos2,
+    line: &LineSegment,
+    xf: &PageXform,
+    info: &DocInfo,
+    tolerance: f32,
+) -> bool {
+    let s = project_user_point(xf, info, line.page, line.start);
+    let e = project_user_point(xf, info, line.page, line.end);
+    let vx = e.x - s.x;
+    let vy = e.y - s.y;
+    let len_sq = vx * vx + vy * vy;
+    let t = if len_sq <= f32::EPSILON {
+        0.0
+    } else {
+        (((pos.x - s.x) * vx + (pos.y - s.y) * vy) / len_sq).clamp(0.0, 1.0)
+    };
+    let px = s.x + t * vx;
+    let py = s.y + t * vy;
+    let dx = pos.x - px;
+    let dy = pos.y - py;
+    (dx * dx + dy * dy).sqrt() <= tolerance
+}
+
+/// Paint a highlight over a line segment. Does nothing if the segment is
+/// offscreen or degenerate.
+pub fn paint_line_highlight(
+    painter: &egui::Painter,
+    line: &LineSegment,
+    state: LineHighlightState,
+    xf: &PageXform,
+    info: &DocInfo,
+) {
+    let s = project_user_point(xf, info, line.page, line.start);
+    let e = project_user_point(xf, info, line.page, line.end);
+    let width = (line.thickness as f32).clamp(1.5, 6.0);
+    painter.line_segment([s, e], Stroke::new(width, state.color()));
+}
+
+pub fn project_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: [f64; 2]) -> Pos2 {
+    // ADAPT: PageXform::user_rect projection (crates/ui-egui/src/canvas.rs:2280)
+    xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32 + 1.0, p[1] as f32 + 1.0]).min
 }
 
 #[cfg(test)]

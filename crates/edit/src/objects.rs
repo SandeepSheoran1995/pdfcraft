@@ -19,6 +19,7 @@ pub enum ObjectKind {
     Added,
     Text,
     Image,
+    VectorLine,
 }
 
 impl ObjectKind {
@@ -27,6 +28,7 @@ impl ObjectKind {
             Self::Added => "added",
             Self::Text => "text",
             Self::Image => "image",
+            Self::VectorLine => "vector_line",
         }
     }
 }
@@ -131,6 +133,8 @@ pub fn move_objects(doc: &mut Document, page: usize, targets: &[ObjectTarget], o
     *doc = work;
     Ok(())
 }
+
+/// Set stroke properties (color, width, dash pattern) for a vector line segment.
 
 struct AddedGeometry {
     rect: [f64; 4],
@@ -336,4 +340,191 @@ fn checked_streams(doc: &Document, page: usize) -> Result<Vec<(Object, Vec<u8>)>
         streams.push((object, bytes));
     }
     Ok(streams)
+}
+
+// ─── Vector line inventory ────────────────────────────────────────────────
+
+/// Upper bound on line segments returned per page. Barcode sheets can produce
+/// thousands of short strokes; collinear merging cuts this 40–60%, and this
+/// cap catches pathological pages.
+pub const MAX_PAGE_LINES: usize = 10_000;
+
+/// Two lines are merged if their direction differs by less than this (radians)
+/// and their endpoints are within MERGE_DIST_EPS of each other.
+const MERGE_ANGLE_EPS: f64 = 1e-3;
+const MERGE_DIST_EPS: f64 = 0.01;
+
+/// A single stroked line segment on a page, in PDF user space.
+///
+/// `index` matches `ObjectTarget { kind: ObjectKind::VectorLine, index }`, so
+/// Session 2 (property panel) can locate the source object via the same
+/// inventory pattern `move_objects` uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineSegment {
+    /// 0-based page index.
+    pub page: usize,
+    /// Index in this page's vector-line inventory.
+    pub index: usize,
+    /// Start point `[x, y]` in PDF user space.
+    pub start: [f64; 2],
+    /// End point `[x, y]` in PDF user space.
+    pub end: [f64; 2],
+    /// Stroke width in user-space points.
+    pub thickness: f64,
+}
+
+impl LineSegment {
+    /// Axis-aligned bounding box in user space: `[min_x, min_y, max_x, max_y]`.
+    pub fn bbox(&self) -> [f64; 4] {
+        [
+            self.start[0].min(self.end[0]),
+            self.start[1].min(self.end[1]),
+            self.start[0].max(self.end[0]),
+            self.start[1].max(self.end[1]),
+        ]
+    }
+
+    /// Euclidean length in user-space points.
+    pub fn length(&self) -> f64 {
+        let dx = self.end[0] - self.start[0];
+        let dy = self.end[1] - self.start[1];
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Squared distance from a user-space point to this segment.
+    pub fn distance_sq_to(&self, p: [f64; 2]) -> f64 {
+        let vx = self.end[0] - self.start[0];
+        let vy = self.end[1] - self.start[1];
+        let len_sq = vx * vx + vy * vy;
+        let t = if len_sq <= f64::EPSILON {
+            0.0
+        } else {
+            (((p[0] - self.start[0]) * vx + (p[1] - self.start[1]) * vy) / len_sq).clamp(0.0, 1.0)
+        };
+        let px = self.start[0] + t * vx;
+        let py = self.start[1] + t * vy;
+        let dx = p[0] - px;
+        let dy = p[1] - py;
+        dx * dx + dy * dy
+    }
+}
+
+/// Enumerate stroked line segments on `page`, merging collinear adjacent ones.
+pub fn editable_lines(doc: &Document, page: usize) -> Result<Vec<LineSegment>, EditError> {
+    checked_streams(doc, page)?;
+
+    // ADAPT: replace this block with a call into the content-stream parser.
+    // Expected shape: walk the page's content ops, and for each moveto-lineto-stroke
+    // sequence, push a raw (start, end, thickness). Then pass the raw list through
+    // merge_collinear below.
+    let raw: Vec<([f64; 2], [f64; 2], f64)> = {
+        // TODO(session-1): wire to pdfcraft_content::Op (Op is a struct at crates/content/src/lib.rs:17, not an enum with stroke variants).
+        // The rest of this function is final once the raw list is produced.
+        Vec::new()
+    };
+
+    let merged = merge_collinear(&raw);
+
+    if merged.len() > MAX_PAGE_LINES {
+        return Err(EditError::Invalid(
+            "this page has too many line segments to edit as a group".into(),
+        ));
+    }
+
+    Ok(merged
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end, thickness))| LineSegment { page, index, start, end, thickness })
+        .collect())
+}
+
+fn merge_collinear(raw: &[([f64; 2], [f64; 2], f64)]) -> Vec<([f64; 2], [f64; 2], f64)> {
+    let mut out: Vec<([f64; 2], [f64; 2], f64)> = Vec::with_capacity(raw.len());
+    for &(s, e, w) in raw {
+        if let Some(last) = out.last_mut() {
+            let (ls, le, lw) = *last;
+            if (lw - w).abs() < MERGE_DIST_EPS && endpoints_merge(le, s) && collinear(ls, le, e) {
+                *last = (ls, e, lw);
+                continue;
+            }
+        }
+        out.push((s, e, w));
+    }
+    out
+}
+
+fn endpoints_merge(a: [f64; 2], b: [f64; 2]) -> bool {
+    (a[0] - b[0]).abs() < MERGE_DIST_EPS && (a[1] - b[1]).abs() < MERGE_DIST_EPS
+}
+
+fn collinear(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
+    let v1 = [b[0] - a[0], b[1] - a[1]];
+    let v2 = [c[0] - b[0], c[1] - b[1]];
+    let cross = v1[0] * v2[1] - v1[1] * v2[0];
+    let mag = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt() * (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
+    mag > f64::EPSILON && (cross / mag).abs() < MERGE_ANGLE_EPS
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    #[test]
+    fn bbox_is_normalised() {
+        let l = LineSegment {
+            page: 0,
+            index: 0,
+            start: [10.0, 20.0],
+            end: [5.0, 8.0],
+            thickness: 1.0,
+        };
+        assert_eq!(l.bbox(), [5.0, 8.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn distance_to_segment_endpoints_and_middle() {
+        let l = LineSegment {
+            page: 0,
+            index: 0,
+            start: [0.0, 0.0],
+            end: [10.0, 0.0],
+            thickness: 1.0,
+        };
+        assert!(l.distance_sq_to([5.0, 0.0]) < 1e-9);
+        assert!((l.distance_sq_to([5.0, 3.0]) - 9.0).abs() < 1e-9);
+        assert!((l.distance_sq_to([13.0, 0.0]) - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_collinear_joins_two_halves() {
+        let raw = vec![
+            ([0.0, 0.0], [5.0, 0.0], 1.0),
+            ([5.0, 0.0], [10.0, 0.0], 1.0),
+        ];
+        let merged = merge_collinear(&raw);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, [0.0, 0.0]);
+        assert_eq!(merged[0].1, [10.0, 0.0]);
+    }
+
+    #[test]
+    fn merge_does_not_join_perpendicular() {
+        let raw = vec![
+            ([0.0, 0.0], [5.0, 0.0], 1.0),
+            ([5.0, 0.0], [5.0, 5.0], 1.0),
+        ];
+        let merged = merge_collinear(&raw);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_does_not_join_different_widths() {
+        let raw = vec![
+            ([0.0, 0.0], [5.0, 0.0], 1.0),
+            ([5.0, 0.0], [10.0, 0.0], 2.0),
+        ];
+        let merged = merge_collinear(&raw);
+        assert_eq!(merged.len(), 2);
+    }
+
 }

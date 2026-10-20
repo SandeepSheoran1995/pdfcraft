@@ -429,6 +429,7 @@ pub(crate) fn snapshot_tab_name(title: &str, file_name: &str, snapshot: &Snapsho
     }
 }
 
+
 pub struct DocView {
     pub id: DocId,
     pub zoom: f32,
@@ -614,6 +615,8 @@ pub struct DocView {
     pub fill_text: Option<crate::fill_sign::TypeBox>,
     /// Interactive canvas element selection state.
     pub canvas_selection: crate::canvas_selection::SelectionState,
+    /// Whether vector line editing mode is active.
+    pub vector_edit_mode: bool,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
@@ -902,6 +905,7 @@ impl DocView {
             marquee_done: None,
             fill_text: None,
             canvas_selection: Default::default(),
+            vector_edit_mode: false,
             barcode_hud: Default::default(),
             barcode_scan: None,
             fill_signature_page: None,
@@ -3492,7 +3496,56 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 && let Some(p) = pointer.filter(|p| xf.rect.contains(*p))
             {
                 let shift = ui.input(|inp| inp.modifiers.shift);
-                if resp.double_clicked() {
+                if view.vector_edit_mode {
+                    let page_lines = doc.editable_lines(i).unwrap_or_default();
+                    if resp.clicked() || resp.secondary_clicked() {
+                        let mut closest: Option<(f32, crate::canvas_selection::SelectableElement)> = None;
+                        for line in &page_lines {
+                            if crate::canvas_selection::hit_test_line(p, line, &xf, info, 6.0) {
+                                let s = crate::canvas_selection::project_user_point(&xf, info, line.page, line.start);
+                                let e = crate::canvas_selection::project_user_point(&xf, info, line.page, line.end);
+                                let vx = e.x - s.x;
+                                let vy = e.y - s.y;
+                                let len_sq = vx * vx + vy * vy;
+                                let t = if len_sq <= f32::EPSILON { 0.0 } else { (((p.x - s.x) * vx + (p.y - s.y) * vy) / len_sq).clamp(0.0, 1.0) };
+                                let px = s.x + t * vx;
+                                let py = s.y + t * vy;
+                                let dist = (p.x - px).hypot(p.y - py);
+                                if closest.as_ref().map_or(true, |(d, _)| dist < *d) {
+                                    closest = Some((dist, crate::canvas_selection::SelectableElement::new_line_vector(i, line.clone())));
+                                }
+                            }
+                        }
+                        if let Some((_, el)) = closest {
+                            view.canvas_selection.select_element(el, shift);
+                        } else if !shift && view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == i) {
+                            view.canvas_selection.clear();
+                        }
+                    } else if !view.canvas_selection.has_selection() {
+                        let mut closest: Option<(f32, crate::canvas_selection::SelectableElement)> = None;
+                        for line in &page_lines {
+                            if crate::canvas_selection::hit_test_line(p, line, &xf, info, 6.0) {
+                                let s = crate::canvas_selection::project_user_point(&xf, info, line.page, line.start);
+                                let e = crate::canvas_selection::project_user_point(&xf, info, line.page, line.end);
+                                let vx = e.x - s.x;
+                                let vy = e.y - s.y;
+                                let len_sq = vx * vx + vy * vy;
+                                let t = if len_sq <= f32::EPSILON { 0.0 } else { (((p.x - s.x) * vx + (p.y - s.y) * vy) / len_sq).clamp(0.0, 1.0) };
+                                let px = s.x + t * vx;
+                                let py = s.y + t * vy;
+                                let dist = (p.x - px).hypot(p.y - py);
+                                if closest.as_ref().map_or(true, |(d, _)| dist < *d) {
+                                    closest = Some((dist, crate::canvas_selection::SelectableElement::new_line_vector(i, line.clone())));
+                                }
+                            }
+                        }
+                        if let Some((_, el)) = closest {
+                            view.canvas_selection.hovered = Some(el);
+                        } else if view.canvas_selection.hovered.as_ref().is_some_and(|h| h.page == i) {
+                            view.canvas_selection.hovered = None;
+                        }
+                    }
+                } else if resp.double_clicked() {
                     if let Some((idx, _block)) =
                         lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
                     {
@@ -3533,6 +3586,22 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 crate::canvas_selection::SelectionLayoutEngine::paint_selection_overlay(ui, painter, i, &xf, info, &mut view.canvas_selection)
             {
                 view.pending_edit = Some(edit);
+            }
+            if let Some(sel) = &view.canvas_selection.selected {
+                if sel.page == i && let Some(line) = &sel.line {
+                    crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Selected, &xf, info);
+                }
+            }
+            for sel in &view.canvas_selection.multi_selected {
+                if sel.page == i && let Some(line) = &sel.line {
+                    crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Selected, &xf, info);
+                }
+            }
+            if let Some(hov) = &view.canvas_selection.hovered {
+                let is_selected = view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == hov.page && s.kind == hov.kind && s.index == hov.index);
+                if !is_selected && hov.page == i && let Some(line) = &hov.line {
+                    crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Hover, &xf, info);
+                }
             }
 
             // Text layer: find matches, selection, I-beam and drag-to-select.
