@@ -71,15 +71,7 @@ impl SelectableElement {
     /// Construct a selectable vector-line element.
     pub fn new_line_vector(page: usize, line: LineSegment) -> Self {
         let bbox = line.bbox();
-        Self {
-            page,
-            kind: SelectableKind::VectorLine,
-            index: line.index,
-            user_rect: bbox,
-            text: None,
-            baseline: None,
-            line: Some(line),
-        }
+        Self { page, kind: SelectableKind::VectorLine, index: line.index, user_rect: bbox, text: None, baseline: None, line: Some(line) }
     }
 
     /// Transform the user-space bounding box to screen coordinates.
@@ -106,6 +98,8 @@ pub enum SelectionHandle {
     Bottom,
     Left,
     Move,
+    LineStart,
+    LineEnd,
 }
 
 impl SelectionHandle {
@@ -117,6 +111,7 @@ impl SelectionHandle {
             Self::Top | Self::Bottom => CursorIcon::ResizeVertical,
             Self::Left | Self::Right => CursorIcon::ResizeHorizontal,
             Self::Move => CursorIcon::Move,
+            Self::LineStart | Self::LineEnd => CursorIcon::Crosshair,
         }
     }
 
@@ -183,6 +178,7 @@ impl SelectionHandle {
                 min += delta;
                 max += delta;
             }
+            Self::LineStart | Self::LineEnd => {}
         }
         // Enforce minimum dimensions of 10 points and prevent rectangle inversion
         const MIN_SIZE: f32 = 10.0;
@@ -389,25 +385,14 @@ impl SelectionLayoutEngine {
                             page: sel.page,
                             block: sel.index,
                             text: sel.text.clone().unwrap_or_default(),
-                            style: pdfcraft_engine::BlockStyle {
-                                width: Some(new_w),
-                                ..Default::default()
-                            },
+                            style: pdfcraft_engine::BlockStyle { width: Some(new_w), ..Default::default() },
                         });
                     }
                     SelectableKind::Image => {
-                        pending_edit = Some(Edit::EditPageImage {
-                            page: sel.page,
-                            index: sel.index,
-                            change: ImageEdit::Move(sel.user_rect),
-                        });
+                        pending_edit = Some(Edit::EditPageImage { page: sel.page, index: sel.index, change: ImageEdit::Move(sel.user_rect) });
                     }
                     SelectableKind::TextLine => {
-                        pending_edit = Some(Edit::EditTextLine {
-                            page: sel.page,
-                            line: sel.index,
-                            text: sel.text.clone().unwrap_or_default(),
-                        });
+                        pending_edit = Some(Edit::EditTextLine { page: sel.page, line: sel.index, text: sel.text.clone().unwrap_or_default() });
                     }
                     SelectableKind::AddedContent | SelectableKind::VectorLine => {}
                 }
@@ -589,8 +574,7 @@ impl FloatingContextMenu {
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        let shortcut =
-                            |key: &'static str| crate::commands::shortcut_label(ui.ctx(), pdfcraft_engine::commands::Shortcut::cmd(key));
+                        let shortcut = |key: &'static str| crate::commands::shortcut_label(ui.ctx(), pdfcraft_engine::commands::Shortcut::cmd(key));
                         let cut_tip = crate::i18n::fmt(tl!("Cut ({key})"), &[("key", &shortcut("X"))]);
                         let copy_tip = crate::i18n::fmt(tl!("Copy ({key})"), &[("key", &shortcut("C"))]);
                         let paste_tip = crate::i18n::fmt(tl!("Paste ({key})"), &[("key", &shortcut("V"))]);
@@ -616,11 +600,7 @@ impl FloatingContextMenu {
                                     "brush",
                                     26.0,
                                     has_format,
-                                    if has_format {
-                                        tl!("Apply formatting (Format Painter)")
-                                    } else {
-                                        tl!("Pick up formatting (Format Painter)")
-                                    },
+                                    if has_format { tl!("Apply formatting (Format Painter)") } else { tl!("Pick up formatting (Format Painter)") },
                                 )
                                 .clicked()
                                 {
@@ -645,7 +625,9 @@ impl FloatingContextMenu {
                                 if crate::icons::button(ui, "strikethrough", 26.0, false, tl!("Strikethrough")).clicked() {
                                     action = Some(FloatingMenuAction::ToggleStrikethrough);
                                 }
-                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, tl!("Insert symbol")).clicked() {
+                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, tl!("Insert symbol"))
+                                    .clicked()
+                                {
                                     action = Some(FloatingMenuAction::OpenSymbolPalette);
                                 }
                             }
@@ -692,23 +674,13 @@ impl LineHighlightState {
 /// Hit-test a single line segment against a screen-space position.
 ///
 /// `tolerance` is the pick radius in screen pixels, typically 4–6.
-pub fn hit_test_line(
-    pos: Pos2,
-    line: &LineSegment,
-    xf: &PageXform,
-    info: &DocInfo,
-    tolerance: f32,
-) -> bool {
+pub fn hit_test_line(pos: Pos2, line: &LineSegment, xf: &PageXform, info: &DocInfo, tolerance: f32) -> bool {
     let s = project_user_point(xf, info, line.page, line.start);
     let e = project_user_point(xf, info, line.page, line.end);
     let vx = e.x - s.x;
     let vy = e.y - s.y;
     let len_sq = vx * vx + vy * vy;
-    let t = if len_sq <= f32::EPSILON {
-        0.0
-    } else {
-        (((pos.x - s.x) * vx + (pos.y - s.y) * vy) / len_sq).clamp(0.0, 1.0)
-    };
+    let t = if len_sq <= f32::EPSILON { 0.0 } else { (((pos.x - s.x) * vx + (pos.y - s.y) * vy) / len_sq).clamp(0.0, 1.0) };
     let px = s.x + t * vx;
     let py = s.y + t * vy;
     let dx = pos.x - px;
@@ -718,13 +690,7 @@ pub fn hit_test_line(
 
 /// Paint a highlight over a line segment. Does nothing if the segment is
 /// offscreen or degenerate.
-pub fn paint_line_highlight(
-    painter: &egui::Painter,
-    line: &LineSegment,
-    state: LineHighlightState,
-    xf: &PageXform,
-    info: &DocInfo,
-) {
+pub fn paint_line_highlight(painter: &egui::Painter, line: &LineSegment, state: LineHighlightState, xf: &PageXform, info: &DocInfo) {
     let s = project_user_point(xf, info, line.page, line.start);
     let e = project_user_point(xf, info, line.page, line.end);
     let width = (line.thickness as f32).clamp(1.5, 6.0);
@@ -734,6 +700,48 @@ pub fn paint_line_highlight(
 pub fn project_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: [f64; 2]) -> Pos2 {
     // ADAPT: PageXform::user_rect projection (crates/ui-egui/src/canvas.rs:2280)
     xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32 + 1.0, p[1] as f32 + 1.0]).min
+}
+
+/// Screen-space rectangles for the two endpoint handles of a line.
+/// Only meaningful when the line is the sole selection.
+pub fn line_endpoint_handles(line: &pdfcraft_engine::LineSegment, xf: &PageXform, info: &DocInfo, size: f32) -> [(SelectionHandle, Rect); 2] {
+    let s = project_user_point(xf, info, line.page, line.start);
+    let e = project_user_point(xf, info, line.page, line.end);
+    [
+        (SelectionHandle::LineStart, Rect::from_center_size(s, vec2(size, size))),
+        (SelectionHandle::LineEnd, Rect::from_center_size(e, vec2(size, size))),
+    ]
+}
+
+/// Hit-test the endpoint handles of a line. Uses an expanded reach beyond the
+/// visible handle (8 pixels minimum) so a tap on mobile still connects.
+pub fn hit_test_line_endpoint(line: &pdfcraft_engine::LineSegment, pos: Pos2, xf: &PageXform, info: &DocInfo, size: f32) -> Option<SelectionHandle> {
+    let reach = (size * 0.5).max(8.0);
+    for (handle, rect) in line_endpoint_handles(line, xf, info, size) {
+        if rect.expand(reach).contains(pos) {
+            return Some(handle);
+        }
+    }
+    None
+}
+
+/// Paint endpoint handles for a selected vector line.
+pub fn paint_line_endpoint_handles(painter: &egui::Painter, line: &pdfcraft_engine::LineSegment, xf: &PageXform, info: &DocInfo, size: f32) {
+    for (_, rect) in line_endpoint_handles(line, xf, info, size) {
+        painter.rect(rect, CornerRadius::same(1), Color32::WHITE, Stroke::new(1.0, ACCENT_BLUE), egui::StrokeKind::Middle);
+    }
+}
+
+/// Screen point → PDF user space point for a given page.
+/// Inverse of [`project_user_point`].
+pub fn screen_to_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: Pos2) -> [f64; 2] {
+    let (vx, vy) = xf.screen_to_view(p);
+    if let Some(page_info) = info.pages.get(page) {
+        let u = page_info.view_to_user(vx, vy);
+        [u[0] as f64, u[1] as f64]
+    } else {
+        [0.0, 0.0]
+    }
 }
 
 #[cfg(test)]

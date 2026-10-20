@@ -429,7 +429,6 @@ pub(crate) fn snapshot_tab_name(title: &str, file_name: &str, snapshot: &Snapsho
     }
 }
 
-
 /// Local state for the vector line properties panel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinePropertiesState {
@@ -441,12 +440,7 @@ pub struct LinePropertiesState {
 
 impl Default for LinePropertiesState {
     fn default() -> Self {
-        Self {
-            color: [0.0, 0.0, 0.0],
-            width: 1.0,
-            dash_idx: 0,
-            last_error: None,
-        }
+        Self { color: [0.0, 0.0, 0.0], width: 1.0, dash_idx: 0, last_error: None }
     }
 }
 
@@ -639,6 +633,8 @@ pub struct DocView {
     pub vector_edit_mode: bool,
     /// Local state for vector line property editing panel.
     pub line_properties: LinePropertiesState,
+    /// Active vector line endpoint drag: `(handle, new_endpoint_user_coord)`.
+    pub line_drag: Option<(crate::canvas_selection::SelectionHandle, [f64; 2])>,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
@@ -929,6 +925,7 @@ impl DocView {
             canvas_selection: Default::default(),
             vector_edit_mode: false,
             line_properties: Default::default(),
+            line_drag: None,
             barcode_hud: Default::default(),
             barcode_scan: None,
             fill_signature_page: None,
@@ -2937,12 +2934,15 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             // quick-action bar as the layout does.
             let (x, w) = (view.last_scroll.x, avail.width());
             let (left, right) = (r.left() - SIDE, r.right() + SIDE);
-            let target = if right - left <= w { if left >= x && right <= x + w { x } else { r.center().x - w / 2.0 } } else { x.clamp(left, right - w) };
+            let target =
+                if right - left <= w { if left >= x && right <= x + w { x } else { r.center().x - w / 2.0 } } else { x.clamp(left, right - w) };
             if (target - x).abs() > 0.5 {
                 scroll = scroll.horizontal_scroll_offset(target.clamp(0.0, (content_w - w).max(0.0)));
             }
         }
-    } else if !view.continuous && let Some(target_y) = view.single_page_target_y {
+    } else if !view.continuous
+        && let Some(target_y) = view.single_page_target_y
+    {
         scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
         if !texture_ready {
             ui.ctx().request_repaint();
@@ -3521,7 +3521,41 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 let shift = ui.input(|inp| inp.modifiers.shift);
                 if view.vector_edit_mode {
                     let page_lines = doc.editable_lines(i).unwrap_or_default();
-                    if resp.clicked() || resp.secondary_clicked() {
+                    let mut endpoint_hit = None;
+                    if let Some(sel) = &view.canvas_selection.selected
+                        && sel.page == i
+                        && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                        && view.canvas_selection.multi_selected.is_empty()
+                        && let Some(line) = &sel.line
+                    {
+                        endpoint_hit = crate::canvas_selection::hit_test_line_endpoint(line, p, &xf, info, 8.0);
+                    }
+
+                    if let Some(handle) = endpoint_hit {
+                        ui.ctx().set_cursor_icon(handle.cursor_icon());
+                        if resp.drag_started() || (resp.clicked() && view.line_drag.is_none()) {
+                            let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
+                            view.line_drag = Some((handle, user_p));
+                            view.canvas_selection.active_handle = Some(handle);
+                        }
+                    }
+
+                    if let Some((handle, _)) = view.line_drag {
+                        ui.ctx().set_cursor_icon(handle.cursor_icon());
+                        if resp.dragged() {
+                            let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
+                            view.line_drag = Some((handle, user_p));
+                            ui.ctx().request_repaint();
+                        }
+                        if resp.drag_stopped() {
+                            view.line_properties.last_error = Some(
+                                "line endpoint editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
+                            );
+                            view.line_drag = None;
+                            view.canvas_selection.active_handle = None;
+                            ui.ctx().request_repaint();
+                        }
+                    } else if resp.clicked() || resp.secondary_clicked() {
                         let mut closest: Option<(f32, crate::canvas_selection::SelectableElement)> = None;
                         for line in &page_lines {
                             if crate::canvas_selection::hit_test_line(p, line, &xf, info, 6.0) {
@@ -3534,7 +3568,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                                 let px = s.x + t * vx;
                                 let py = s.y + t * vy;
                                 let dist = (p.x - px).hypot(p.y - py);
-                                if closest.as_ref().map_or(true, |(d, _)| dist < *d) {
+                                if closest.as_ref().is_none_or(|(d, _)| dist < *d) {
                                     closest = Some((dist, crate::canvas_selection::SelectableElement::new_line_vector(i, line.clone())));
                                 }
                             }
@@ -3557,7 +3591,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                                 let px = s.x + t * vx;
                                 let py = s.y + t * vy;
                                 let dist = (p.x - px).hypot(p.y - py);
-                                if closest.as_ref().map_or(true, |(d, _)| dist < *d) {
+                                if closest.as_ref().is_none_or(|(d, _)| dist < *d) {
                                     closest = Some((dist, crate::canvas_selection::SelectableElement::new_line_vector(i, line.clone())));
                                 }
                             }
@@ -3582,9 +3616,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                         let el = crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone());
                         view.canvas_selection.select_element(el, shift);
                     } else if !shift && view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == i) {
-                        let near_selection = view.canvas_selection.selected.as_ref().is_some_and(|s| {
-                            s.screen_rect(&xf, info).expand(8.0).contains(p)
-                        });
+                        let near_selection =
+                            view.canvas_selection.selected.as_ref().is_some_and(|s| s.screen_rect(&xf, info).expand(8.0).contains(p));
                         if !near_selection {
                             view.canvas_selection.clear();
                         }
@@ -3610,19 +3643,44 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             {
                 view.pending_edit = Some(edit);
             }
-            if let Some(sel) = &view.canvas_selection.selected {
-                if sel.page == i && let Some(line) = &sel.line {
-                    crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Selected, &xf, info);
-                }
+            if let Some(sel) = &view.canvas_selection.selected
+                && sel.page == i
+                && let Some(line) = &sel.line
+            {
+                let preview_line = if let Some((h, user_p)) = &view.line_drag {
+                    let mut pl = line.clone();
+                    match h {
+                        crate::canvas_selection::SelectionHandle::LineStart => pl.start = *user_p,
+                        crate::canvas_selection::SelectionHandle::LineEnd => pl.end = *user_p,
+                        _ => {}
+                    }
+                    pl
+                } else {
+                    line.clone()
+                };
+                crate::canvas_selection::paint_line_highlight(
+                    painter,
+                    &preview_line,
+                    crate::canvas_selection::LineHighlightState::Selected,
+                    &xf,
+                    info,
+                );
+                crate::canvas_selection::paint_line_endpoint_handles(painter, &preview_line, &xf, info, 7.0);
             }
             for sel in &view.canvas_selection.multi_selected {
-                if sel.page == i && let Some(line) = &sel.line {
+                if sel.page == i
+                    && let Some(line) = &sel.line
+                {
                     crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Selected, &xf, info);
                 }
             }
             if let Some(hov) = &view.canvas_selection.hovered {
-                let is_selected = view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == hov.page && s.kind == hov.kind && s.index == hov.index);
-                if !is_selected && hov.page == i && let Some(line) = &hov.line {
+                let is_selected =
+                    view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == hov.page && s.kind == hov.kind && s.index == hov.index);
+                if !is_selected
+                    && hov.page == i
+                    && let Some(line) = &hov.line
+                {
                     crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Hover, &xf, info);
                 }
             }

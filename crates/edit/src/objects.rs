@@ -147,20 +147,20 @@ pub fn set_line_properties(
     if target.kind != ObjectKind::VectorLine {
         return Err(EditError::Invalid("expected target kind VectorLine".into()));
     }
-    if let Some(c) = color {
-        if !c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
-            return Err(EditError::Invalid("color channel must be finite and between 0.0 and 1.0".into()));
-        }
+    if let Some(c) = color
+        && !c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+    {
+        return Err(EditError::Invalid("color channel must be finite and between 0.0 and 1.0".into()));
     }
-    if let Some(w) = width {
-        if !w.is_finite() || !(0.5..=20.0).contains(&w) {
-            return Err(EditError::Invalid("width must be finite and between 0.5 and 20.0".into()));
-        }
+    if let Some(w) = width
+        && (!w.is_finite() || !(0.5..=20.0).contains(&w))
+    {
+        return Err(EditError::Invalid("width must be finite and between 0.5 and 20.0".into()));
     }
-    if let Some(ref d) = dash {
-        if d.len() > 8 || !d.iter().all(|v| v.is_finite() && (0.0..=100.0).contains(v)) {
-            return Err(EditError::Invalid("dash values must be finite, between 0.0 and 100.0, and have length <= 8".into()));
-        }
+    if let Some(ref d) = dash
+        && (d.len() > 8 || !d.iter().all(|v| v.is_finite() && (0.0..=100.0).contains(v)))
+    {
+        return Err(EditError::Invalid("dash values must be finite, between 0.0 and 100.0, and have length <= 8".into()));
     }
 
     // 2. Re-derive the line inventory:
@@ -172,6 +172,34 @@ pub fn set_line_properties(
     // 4. Content stream mutation path is not yet available in the edit crate:
     Err(EditError::Invalid(
         "line property editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
+    ))
+}
+
+/// Update endpoints for a vector line segment on a page.
+pub fn update_line_endpoints(doc: &mut Document, page: usize, target: ObjectTarget, new_start: [f64; 2], new_end: [f64; 2]) -> Result<(), EditError> {
+    // 1. Validate inputs FIRST:
+    if target.kind != ObjectKind::VectorLine {
+        return Err(EditError::Invalid("expected target kind VectorLine".into()));
+    }
+    if !new_start.iter().chain(new_end.iter()).all(|v| v.is_finite() && v.abs() <= MAX_COORDINATE) {
+        return Err(EditError::Invalid("coordinates must be finite and within MAX_COORDINATE".into()));
+    }
+    if new_start == new_end {
+        return Err(EditError::Invalid("new_start and new_end must not be identical (zero-length line)".into()));
+    }
+    if pdfcraft_model::pages(doc).into_iter().nth(page).is_none() {
+        return Err(EditError::NoSuchPage(page));
+    }
+
+    // 2. Re-derive the line inventory:
+    let inventory = editable_lines(doc, page)?;
+
+    // 3. Find the target by (page, index):
+    let _line = inventory.iter().find(|l| l.index == target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
+
+    // 4. Content stream mutation path is not yet available in the edit crate (stubbed per D6d):
+    Err(EditError::Invalid(
+        "line endpoint editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
     ))
 }
 
@@ -415,12 +443,7 @@ pub struct LineSegment {
 impl LineSegment {
     /// Axis-aligned bounding box in user space: `[min_x, min_y, max_x, max_y]`.
     pub fn bbox(&self) -> [f64; 4] {
-        [
-            self.start[0].min(self.end[0]),
-            self.start[1].min(self.end[1]),
-            self.start[0].max(self.end[0]),
-            self.start[1].max(self.end[1]),
-        ]
+        [self.start[0].min(self.end[0]), self.start[1].min(self.end[1]), self.start[0].max(self.end[0]), self.start[1].max(self.end[1])]
     }
 
     /// Euclidean length in user-space points.
@@ -435,11 +458,7 @@ impl LineSegment {
         let vx = self.end[0] - self.start[0];
         let vy = self.end[1] - self.start[1];
         let len_sq = vx * vx + vy * vy;
-        let t = if len_sq <= f64::EPSILON {
-            0.0
-        } else {
-            (((p[0] - self.start[0]) * vx + (p[1] - self.start[1]) * vy) / len_sq).clamp(0.0, 1.0)
-        };
+        let t = if len_sq <= f64::EPSILON { 0.0 } else { (((p[0] - self.start[0]) * vx + (p[1] - self.start[1]) * vy) / len_sq).clamp(0.0, 1.0) };
         let px = self.start[0] + t * vx;
         let py = self.start[1] + t * vy;
         let dx = p[0] - px;
@@ -465,16 +484,10 @@ pub fn editable_lines(doc: &Document, page: usize) -> Result<Vec<LineSegment>, E
     let merged = merge_collinear(&raw);
 
     if merged.len() > MAX_PAGE_LINES {
-        return Err(EditError::Invalid(
-            "this page has too many line segments to edit as a group".into(),
-        ));
+        return Err(EditError::Invalid("this page has too many line segments to edit as a group".into()));
     }
 
-    Ok(merged
-        .into_iter()
-        .enumerate()
-        .map(|(index, (start, end, thickness))| LineSegment { page, index, start, end, thickness })
-        .collect())
+    Ok(merged.into_iter().enumerate().map(|(index, (start, end, thickness))| LineSegment { page, index, start, end, thickness }).collect())
 }
 
 fn merge_collinear(raw: &[([f64; 2], [f64; 2], f64)]) -> Vec<([f64; 2], [f64; 2], f64)> {
@@ -510,25 +523,13 @@ mod line_tests {
 
     #[test]
     fn bbox_is_normalised() {
-        let l = LineSegment {
-            page: 0,
-            index: 0,
-            start: [10.0, 20.0],
-            end: [5.0, 8.0],
-            thickness: 1.0,
-        };
+        let l = LineSegment { page: 0, index: 0, start: [10.0, 20.0], end: [5.0, 8.0], thickness: 1.0 };
         assert_eq!(l.bbox(), [5.0, 8.0, 10.0, 20.0]);
     }
 
     #[test]
     fn distance_to_segment_endpoints_and_middle() {
-        let l = LineSegment {
-            page: 0,
-            index: 0,
-            start: [0.0, 0.0],
-            end: [10.0, 0.0],
-            thickness: 1.0,
-        };
+        let l = LineSegment { page: 0, index: 0, start: [0.0, 0.0], end: [10.0, 0.0], thickness: 1.0 };
         assert!(l.distance_sq_to([5.0, 0.0]) < 1e-9);
         assert!((l.distance_sq_to([5.0, 3.0]) - 9.0).abs() < 1e-9);
         assert!((l.distance_sq_to([13.0, 0.0]) - 9.0).abs() < 1e-9);
@@ -536,10 +537,7 @@ mod line_tests {
 
     #[test]
     fn merge_collinear_joins_two_halves() {
-        let raw = vec![
-            ([0.0, 0.0], [5.0, 0.0], 1.0),
-            ([5.0, 0.0], [10.0, 0.0], 1.0),
-        ];
+        let raw = vec![([0.0, 0.0], [5.0, 0.0], 1.0), ([5.0, 0.0], [10.0, 0.0], 1.0)];
         let merged = merge_collinear(&raw);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].0, [0.0, 0.0]);
@@ -548,20 +546,14 @@ mod line_tests {
 
     #[test]
     fn merge_does_not_join_perpendicular() {
-        let raw = vec![
-            ([0.0, 0.0], [5.0, 0.0], 1.0),
-            ([5.0, 0.0], [5.0, 5.0], 1.0),
-        ];
+        let raw = vec![([0.0, 0.0], [5.0, 0.0], 1.0), ([5.0, 0.0], [5.0, 5.0], 1.0)];
         let merged = merge_collinear(&raw);
         assert_eq!(merged.len(), 2);
     }
 
     #[test]
     fn merge_does_not_join_different_widths() {
-        let raw = vec![
-            ([0.0, 0.0], [5.0, 0.0], 1.0),
-            ([5.0, 0.0], [10.0, 0.0], 2.0),
-        ];
+        let raw = vec![([0.0, 0.0], [5.0, 0.0], 1.0), ([5.0, 0.0], [10.0, 0.0], 2.0)];
         let merged = merge_collinear(&raw);
         assert_eq!(merged.len(), 2);
     }
@@ -606,4 +598,30 @@ mod line_tests {
         assert!(err.contains("kind"), "expected error containing 'kind', got: {err}");
     }
 
+    #[test]
+    fn test_update_line_endpoints_rejects_nan() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        let res = update_line_endpoints(&mut doc, 0, target, [f64::NAN, 0.0], [10.0, 0.0]);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("finite") || err.contains("coordinate"), "expected error containing 'finite'/'coordinate', got: {err}");
+    }
+
+    #[test]
+    fn test_update_line_endpoints_rejects_zero_length() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        let res = update_line_endpoints(&mut doc, 0, target, [5.0, 5.0], [5.0, 5.0]);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("zero-length") || err.contains("identical"), "expected error containing 'zero-length'/'identical', got: {err}");
+    }
+
+    #[test]
+    fn test_update_line_endpoints_rejects_wrong_kind() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::Text, index: 0 };
+        let res = update_line_endpoints(&mut doc, 0, target, [0.0, 0.0], [10.0, 0.0]);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("kind"), "expected error containing 'kind', got: {err}");
+    }
 }
