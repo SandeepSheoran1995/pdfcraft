@@ -434,11 +434,11 @@ impl FloatingContextMenu {
                         let paste_tip = crate::i18n::fmt(tl!("Paste ({key})"), &[("key", &shortcut("V"))]);
                         ui.horizontal(|ui| {
                             // Cut (Ctrl+X)
-                            if can_modify && can_copy && crate::icons::button(ui, "scissors", 26.0, false, &cut_tip).clicked() {
+                            if can_modify && can_copy && sel.text.is_some() && crate::icons::button(ui, "scissors", 26.0, false, &cut_tip).clicked() {
                                 action = Some(FloatingMenuAction::Cut);
                             }
                             // Copy (Ctrl+C)
-                            if can_copy && crate::icons::button(ui, "copy", 26.0, false, &copy_tip).clicked() {
+                            if can_copy && sel.text.is_some() && crate::icons::button(ui, "copy", 26.0, false, &copy_tip).clicked() {
                                 action = Some(FloatingMenuAction::Copy);
                             }
                             // Paste (Ctrl+V)

@@ -616,8 +616,8 @@ pub struct DocView {
     pub canvas_selection: crate::canvas_selection::SelectionState,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
-    /// A page scan running on a worker thread: `(document id, page, result)`.
-    pub(crate) barcode_scan: Option<(u64, usize, std::sync::mpsc::Receiver<Vec<pdfcraft_engine::barcode_scan::ScannedCode>>)>,
+    /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
+    pub(crate) barcode_scan: Option<(u64, usize, u64, std::sync::mpsc::Receiver<Vec<pdfcraft_engine::barcode_scan::ScannedCode>>)>,
     /// A queued Fill & Sign signature: select it after its edit succeeds, then leave placement.
     pub(crate) fill_signature_page: Option<usize>,
     pub(crate) signature_drag: crate::signature_drag::SignatureDrag,
@@ -2424,7 +2424,7 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
         |k| ctx.input(|i| i.key_pressed(k) || i.events.iter().any(|e| matches!(e, egui::Event::Key { key: pk, pressed: true, .. } if *pk == k)));
     // The open barcode HUD steps through the page's codes with ← / →; it must not also turn
     // the page and rescan, which would replace the list it is stepping through.
-    let hud_arrows = view.barcode_hud.open && view.barcode_hud.panel_open;
+    let hud_arrows = view.barcode_hud.open && view.barcode_hud.panel_open && view.barcode_hud.scanned_codes.len() > 1;
     if view.line_editor.is_none() {
         let mut did_step = false;
         if !hud_arrows && (key_nav(Key::ArrowRight) || (command && key_nav(Key::PageDown))) {
@@ -4314,15 +4314,16 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             crate::canvas_selection::FloatingMenuAction::ToggleStrikethrough => {
                 if let Some(sel) = &view.canvas_selection.selected
                     && matches!(sel.kind, crate::canvas_selection::SelectableKind::TextBlock | crate::canvas_selection::SelectableKind::TextLine)
-                    && let Some(page_info) = info.pages.get(sel.page)
                 {
                     // A StrikeOut annotation marks the text visually without rewriting it:
                     // inserted U+0336 glyphs show as '?' and corrupt copy, search and export.
+                    let r = sel.user_rect;
+                    let quads = vec![[r[0], r[3], r[2], r[3], r[0], r[1], r[2], r[1]]];
                     view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
                         page: sel.page,
                         shape: pdfcraft_engine::Shape::TextMarkup {
                             kind: comments::CommentTool::StrikeOut.markup().unwrap_or(pdfcraft_engine::Markup::StrikeOut),
-                            quads: vec![page_info.view_rect_to_quad(sel.user_rect.map(|v| v as f32))],
+                            quads,
                         },
                         style: prefs.style(comments::CommentTool::StrikeOut),
                         contents: String::new(),

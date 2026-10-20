@@ -48,11 +48,19 @@ pub fn parse_numeric(s: &str) -> Option<f64> {
         return None;
     }
     // A comma is a thousands separator only in groups of three ("1,234.50", not "1,5").
+    if unsigned.split('.').nth(1).is_some_and(|frac| frac.contains(',')) {
+        return None;
+    }
     if let Some(int_part) = unsigned.split('.').next()
         && int_part.contains(',')
-        && !int_part.split(',').skip(1).all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()))
     {
-        return None;
+        let first_len = int_part.split(',').next().map_or(0, |g| g.len());
+        if !(1..=3).contains(&first_len) {
+            return None;
+        }
+        if !int_part.split(',').skip(1).all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
     }
     // Clean currency and percentage signs
     let mut cleaned = String::with_capacity(trimmed.len());
@@ -397,7 +405,9 @@ mod tests {
         assert_eq!(parse_numeric("02134"), None);
         assert_eq!(parse_numeric("1,5"), None);
         assert_eq!(parse_numeric("555,1234"), None);
-        assert_eq!(parse_numeric("1234567890123456"), None);
+        assert_eq!(parse_numeric("12.34,56"), None);
+        assert_eq!(parse_numeric("1234,567"), None);
+        assert_eq!(parse_numeric(",123"), None);
         assert_eq!(parse_numeric("NotANumber"), None);
         assert_eq!(parse_numeric(""), None);
     }

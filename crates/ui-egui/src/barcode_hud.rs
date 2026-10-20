@@ -122,6 +122,7 @@ impl BarcodeHudState {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn get_downloads_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -205,12 +206,12 @@ impl BarcodeScannerHud {
     pub fn auto_scan_on_page_change(view: &mut DocView, doc: &Document, now: f64, active: bool, ctx: Option<&egui::Context>) {
         // A finished scan belongs to the document and page it was asked for: the user may have
         // turned the page or switched tabs while it ran.
-        if let Some((doc_id, page, rx)) = &view.barcode_scan {
+        if let Some((doc_id, page, generation, rx)) = &view.barcode_scan {
             match rx.try_recv() {
                 Ok(codes) => {
-                    let (doc_id, page) = (*doc_id, *page);
+                    let (doc_id, page, generation) = (*doc_id, *page, *generation);
                     view.barcode_scan = None;
-                    if view.id.0 == doc_id && view.current == page {
+                    if view.id.0 == doc_id && view.current == page && doc.edit_generation() == generation {
                         Self::apply_scan(view, codes, now);
                     }
                 }
@@ -222,8 +223,7 @@ impl BarcodeScannerHud {
             return;
         }
         let current_page = view.current;
-        let pending = matches!(&view.barcode_scan, Some((id, page, _)) if *id == view.id.0 && *page == current_page);
-        if view.barcode_hud.last_scanned_page == Some(current_page) || pending {
+        if view.barcode_scan.is_some() || view.barcode_hud.last_scanned_page == Some(current_page) {
             return;
         }
         view.barcode_hud.last_scanned_page = Some(current_page);
@@ -247,8 +247,9 @@ impl BarcodeScannerHud {
                 ctx.request_repaint();
             }
         });
+        let generation = doc.edit_generation();
         match spawned {
-            Ok(_) => view.barcode_scan = Some((view.id.0, current_page, rx)),
+            Ok(_) => view.barcode_scan = Some((view.id.0, current_page, generation, rx)),
             // No thread could be started: fall back to scanning this frame.
             Err(_) => Self::apply_scan(view, doc.scan_page_codes(current_page), now),
         }
@@ -670,26 +671,27 @@ impl BarcodeScannerHud {
             match Document::generate_replacement_code(active.kind, &active.text, pw, ph) {
                 Ok(png_bytes) => {
                     let kind_name = format!("{:?}", active.kind).to_ascii_lowercase();
-                    let filename = {
-                        let mut n = 0u64;
-                        loop {
-                            let name = format!("barcode_{}_{}_{}.png", kind_name, (now as u64) % 10000, n);
-                            if !get_downloads_dir().join(&name).exists() {
-                                break name;
-                            }
-                            n = n.saturating_add(1);
-                            if n > 1000 {
-                                break format!("barcode_{}_{}.png", kind_name, now as u64);
-                            }
-                        }
-                    };
                     #[cfg(target_arch = "wasm32")]
                     {
+                        let filename = format!("barcode_{}_{}.png", kind_name, now as u64);
                         let _ = crate::editing::download(&filename, &png_bytes);
                         state.show_toast(format!("Downloaded {filename}!"), now);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        let filename = {
+                            let mut n = 0u64;
+                            loop {
+                                let name = format!("barcode_{}_{}_{}.png", kind_name, (now as u64) % 10000, n);
+                                if !get_downloads_dir().join(&name).exists() {
+                                    break name;
+                                }
+                                n = n.saturating_add(1);
+                                if n > 1000 {
+                                    break format!("barcode_{}_{}.png", kind_name, now as u64);
+                                }
+                            }
+                        };
                         let dest = get_downloads_dir().join(&filename);
                         match std::fs::write(&dest, &png_bytes) {
                             Ok(()) => state.show_toast(format!("Saved to Downloads: {filename}"), now),
