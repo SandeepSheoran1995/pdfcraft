@@ -1,5 +1,6 @@
 [package]
 name = "pdfcraft"
+authors = ["Sandeep Sheoran <livesheoranece@gmail.com>"]
 description = "PdfCraft desktop app"
 version.workspace = true
 edition.workspace = true
@@ -70,3 +71,4 @@ uds_windows = "=1.2.1"
 [build-dependencies]
 # Icon + VERSIONINFO for pdfcraft.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
+
