@@ -183,9 +183,10 @@ impl BarcodeScannerHud {
     /// Reactive Auto-Page Tracking hook:
     ///
     /// Scans current page on page change so interactive canvas clicks work immediately.
-    /// Only runs while the HUD is open, since barcode hit areas are interactive only then.
-    pub fn auto_scan_on_page_change(view: &mut DocView, doc: &Document, now: f64) {
-        if !view.barcode_hud.open {
+    /// `active` is the HUD being open or the barcode tool being picked: the scan runs only then,
+    /// but it never opens the HUD by itself.
+    pub fn auto_scan_on_page_change(view: &mut DocView, doc: &Document, now: f64, active: bool) {
+        if !active {
             return;
         }
         let current_page = view.current;
@@ -194,10 +195,11 @@ impl BarcodeScannerHud {
 
             let codes = doc.scan_page_codes(current_page);
             let count = codes.len();
+            let open = view.barcode_hud.open;
             let panel_open = view.barcode_hud.panel_open;
-            view.barcode_hud.update_codes_conditional(codes, true);
+            view.barcode_hud.update_codes_conditional(codes, open);
             view.barcode_hud.panel_open = panel_open;
-            if view.barcode_hud.open {
+            if open {
                 if count > 0 {
                     view.barcode_hud.show_toast(format!("Detected {count} code(s) on page {}", current_page + 1), now);
                 } else {

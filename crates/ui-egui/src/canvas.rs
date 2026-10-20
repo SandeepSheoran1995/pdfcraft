@@ -2948,7 +2948,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         | QuickTool::Link
         | QuickTool::SignArea { .. }
         | QuickTool::MarqueeZoom
-        | QuickTool::Snapshot => false,
+        | QuickTool::Snapshot
+        | QuickTool::QrBarcode => false,
     };
     let prefs = &app.comment_prefs;
     let redact_mark = (app.redact_prefs.hover_fill, app.redact_prefs.opacity);
@@ -4340,9 +4341,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
 
     // Barcode & QR Code Scanner HUD (Unified Single HUD)
     let now = ui.input(|i| i.time);
-    crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, doc, now);
+    let barcode_interactive = view.barcode_hud.open || app.quick_tool == QuickTool::QrBarcode;
+    crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, doc, now, barcode_interactive);
 
-    let barcode_interactive = view.barcode_hud.open;
     if barcode_interactive {
         let current_page = view.current;
         if let Some(xf) = view.page_xform(current_page) {
@@ -5256,6 +5257,17 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                             if v.barcode_hud.open {
                                 v.barcode_hud.last_scanned_page = None;
                             }
+                        }
+                    }
+                    // Barcode select tool: click a code on the page to open its HUD.
+                    let qr_tool = app.quick_tool == QuickTool::QrBarcode;
+                    if icons::button(ui, "scan-text", 32.0, qr_tool, tl!("Select barcodes")).clicked() {
+                        app.quick_tool = if qr_tool { QuickTool::Select } else { QuickTool::QrBarcode };
+                        if !qr_tool
+                            && let Some((tab_idx, _)) = app.active_ids()
+                            && let Some(v) = app.views.get_mut(tab_idx)
+                        {
+                            v.barcode_hud.last_scanned_page = None;
                         }
                     }
                     // Fill & Sign ▸ (text, marks, date, signature).
