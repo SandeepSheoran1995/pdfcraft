@@ -135,6 +135,45 @@ pub fn move_objects(doc: &mut Document, page: usize, targets: &[ObjectTarget], o
 }
 
 /// Set stroke properties (color, width, dash pattern) for a vector line segment.
+pub fn set_line_properties(
+    doc: &mut Document,
+    page: usize,
+    target: ObjectTarget,
+    color: Option<[f64; 3]>,
+    width: Option<f64>,
+    dash: Option<Vec<f64>>,
+) -> Result<(), EditError> {
+    // 1. Validate inputs FIRST (before any mutation):
+    if target.kind != ObjectKind::VectorLine {
+        return Err(EditError::Invalid("expected target kind VectorLine".into()));
+    }
+    if let Some(c) = color {
+        if !c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            return Err(EditError::Invalid("color channel must be finite and between 0.0 and 1.0".into()));
+        }
+    }
+    if let Some(w) = width {
+        if !w.is_finite() || !(0.5..=20.0).contains(&w) {
+            return Err(EditError::Invalid("width must be finite and between 0.5 and 20.0".into()));
+        }
+    }
+    if let Some(ref d) = dash {
+        if d.len() > 8 || !d.iter().all(|v| v.is_finite() && (0.0..=100.0).contains(v)) {
+            return Err(EditError::Invalid("dash values must be finite, between 0.0 and 100.0, and have length <= 8".into()));
+        }
+    }
+
+    // 2. Re-derive the line inventory:
+    let inventory = editable_lines(doc, page)?;
+
+    // 3. Find the target by (page, index):
+    let _line = inventory.iter().find(|l| l.index == target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?;
+
+    // 4. Content stream mutation path is not yet available in the edit crate:
+    Err(EditError::Invalid(
+        "line property editing is not yet supported on this PDF: the content stream mutation path is not implemented. This will be added in a follow-up.".into(),
+    ))
+}
 
 struct AddedGeometry {
     rect: [f64; 4],
@@ -525,6 +564,46 @@ mod line_tests {
         ];
         let merged = merge_collinear(&raw);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_set_line_properties_rejects_nan_color() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        let res = set_line_properties(&mut doc, 0, target, Some([f64::NAN, 0.0, 0.0]), Some(1.0), None);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("color"), "expected error containing 'color', got: {err}");
+    }
+
+    #[test]
+    fn test_set_line_properties_rejects_out_of_range_width() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        let res = set_line_properties(&mut doc, 0, target, None, Some(0.1), None);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("width"), "expected error containing 'width', got: {err}");
+
+        let res2 = set_line_properties(&mut doc, 0, target, None, Some(25.0), None);
+        let err2 = res2.unwrap_err().to_string();
+        assert!(err2.contains("width"), "expected error containing 'width', got: {err2}");
+    }
+
+    #[test]
+    fn test_set_line_properties_rejects_oversized_dash() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        let res = set_line_properties(&mut doc, 0, target, None, Some(1.0), Some(vec![1.0; 9]));
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("dash"), "expected error containing 'dash', got: {err}");
+    }
+
+    #[test]
+    fn test_set_line_properties_rejects_wrong_kind() {
+        let mut doc = Document::new_empty();
+        let target = ObjectTarget { kind: ObjectKind::Text, index: 0 };
+        let res = set_line_properties(&mut doc, 0, target, None, Some(1.0), None);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("kind"), "expected error containing 'kind', got: {err}");
     }
 
 }

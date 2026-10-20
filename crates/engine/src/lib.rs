@@ -57,7 +57,7 @@ pub use pdfcraft_create::{CONVERTIBLE, CreateError, ImageResolution, SourceKind,
 pub use pdfcraft_edit::added::{text_rect as added_text_rect, text_width as added_text_width};
 pub use pdfcraft_edit::{
     Added, AddedImage, AddedText, Align as TextAlign, Background, Content as AddedContent, Family as FontFamily, HeaderFooter, LineSegment,
-    MarkKind, Watermark,
+    MarkKind, Watermark, set_line_properties,
 };
 pub use pdfcraft_forms::{
     BorderStyle, CheckStyle, Field as FormField, FieldAction, FieldChange, FieldFont, FieldKind as FormFieldKind, FieldProps, FieldValue,

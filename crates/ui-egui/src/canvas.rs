@@ -430,6 +430,26 @@ pub(crate) fn snapshot_tab_name(title: &str, file_name: &str, snapshot: &Snapsho
 }
 
 
+/// Local state for the vector line properties panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinePropertiesState {
+    pub color: [f32; 3],
+    pub width: f64,
+    pub dash_idx: usize,
+    pub last_error: Option<String>,
+}
+
+impl Default for LinePropertiesState {
+    fn default() -> Self {
+        Self {
+            color: [0.0, 0.0, 0.0],
+            width: 1.0,
+            dash_idx: 0,
+            last_error: None,
+        }
+    }
+}
+
 pub struct DocView {
     pub id: DocId,
     pub zoom: f32,
@@ -617,6 +637,8 @@ pub struct DocView {
     pub canvas_selection: crate::canvas_selection::SelectionState,
     /// Whether vector line editing mode is active.
     pub vector_edit_mode: bool,
+    /// Local state for vector line property editing panel.
+    pub line_properties: LinePropertiesState,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
@@ -906,6 +928,7 @@ impl DocView {
             fill_text: None,
             canvas_selection: Default::default(),
             vector_edit_mode: false,
+            line_properties: Default::default(),
             barcode_hud: Default::default(),
             barcode_scan: None,
             fill_signature_page: None,

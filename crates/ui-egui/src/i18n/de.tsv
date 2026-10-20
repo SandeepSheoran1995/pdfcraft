@@ -2436,3 +2436,13 @@ animation effects	Off	Aus
 	Make properties default	Eigenschaften als Standard festlegen
 	Pages selected	Ausgewählte Seiten
 	Page properties	Seiteneigenschaften
+# TODO(session-2): German translations for vector line properties panel
+Line Properties	Linien-Eigenschaften
+Color:	Farbe:
+Width:	Breite:
+Solid	Durchgehend
+Dotted	Gepunktet
+Dashed	Gestrichelt
+Dash	Strich
+Apply	Übernehmen
+Toggle vector line editing mode	Vektorlinien-Bearbeitungsmodus umschalten
