@@ -1189,6 +1189,8 @@ pub fn line_properties_panel(
                     ui.selectable_value(&mut view.line_properties.dash_idx, idx, *label);
                 }
             });
+        ui.add_space(4.0);
+        ui.add(crate::widgets::checkbox(&mut view.extend_perpendicular_lines, tl!("Extend touching lines (Excel grid)")));
         ui.add_space(6.0);
 
         if ui.button(tl!("Apply")).clicked() {

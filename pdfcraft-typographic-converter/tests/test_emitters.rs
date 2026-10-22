@@ -1,6 +1,6 @@
 use pdf_typographic_converter::emitters::{export_docx, export_pptx, export_xlsx};
 use pdf_typographic_converter::layout::{
-    DocumentLayout, PageLayout, ScriptType, TextLine, TextRun,
+    DocumentLayout, PageImage, PageLayout, ScriptType, TextLine, TextRun,
 };
 use std::fs::{self, File};
 use std::io::Read;
@@ -98,6 +98,7 @@ fn create_test_layout() -> DocumentLayout {
         width: 595.0,
         height: 842.0,
         lines: vec![line],
+        images: vec![],
     };
 
     let page2 = PageLayout {
@@ -105,6 +106,7 @@ fn create_test_layout() -> DocumentLayout {
         width: 595.0,
         height: 842.0,
         lines: vec![],
+        images: vec![],
     };
 
     DocumentLayout {
@@ -173,23 +175,30 @@ fn test_export_xlsx() {
     // Inspect the generated zip archive for xl/workbook.xml
     let file = File::open(&xlsx_path).expect("Failed to open XLSX");
     let mut archive = zip::ZipArchive::new(file).expect("Failed to parse zip archive");
-    let mut wb_entry = archive
-        .by_name("xl/workbook.xml")
-        .expect("xl/workbook.xml must exist in XLSX");
-
     let mut wb_xml = String::new();
-    wb_entry
-        .read_to_string(&mut wb_xml)
-        .expect("Failed to read workbook.xml");
+    {
+        let mut wb_entry = archive
+            .by_name("xl/workbook.xml")
+            .expect("xl/workbook.xml must exist in XLSX");
+        wb_entry
+            .read_to_string(&mut wb_xml)
+            .expect("Failed to read workbook.xml");
+    }
 
     assert!(
-        wb_xml.contains("Page 1"),
-        "XLSX should contain sheet 'Page 1'"
+        wb_xml.contains("Export"),
+        "XLSX should contain consolidated sheet 'Export'"
     );
-    assert!(
-        wb_xml.contains("Page 2"),
-        "XLSX should contain sheet 'Page 2'"
-    );
+
+    let mut ss_entry = archive
+        .by_name("xl/sharedStrings.xml")
+        .expect("xl/sharedStrings.xml must exist in XLSX");
+    let mut ss_xml = String::new();
+    ss_entry
+        .read_to_string(&mut ss_xml)
+        .expect("Failed to read sharedStrings.xml");
+    assert!(ss_xml.contains("Heading"), "Shared strings should contain Page 1 text");
+    assert!(ss_xml.contains("Page 2"), "Shared strings should contain Page 2 divider");
 
     let _ = fs::remove_file(&xlsx_path);
 }
@@ -240,4 +249,159 @@ fn test_export_pptx() {
     );
 
     let _ = fs::remove_file(&pptx_path);
+}
+
+#[test]
+fn test_export_docx_with_images() {
+    let temp_dir = std::env::temp_dir();
+    let docx_path = temp_dir.join("test_docx_with_images.docx");
+
+    let tiny_png = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
+        6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192,
+        240, 31, 0, 5, 0, 1, 255, 137, 91, 38, 59, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    let page = PageLayout {
+        page_index: 0,
+        width: 612.0,
+        height: 792.0,
+        lines: vec![],
+        images: vec![PageImage {
+            bytes: tiny_png,
+            bounds: (50.0, 700.0, 150.0, 600.0),
+            width_pt: 100.0,
+            height_pt: 100.0,
+        }],
+    };
+
+    let doc = DocumentLayout { pages: vec![page] };
+
+    export_docx(&doc, &docx_path).expect("DOCX export with image failed");
+    assert!(docx_path.exists());
+    let metadata = fs::metadata(&docx_path).expect("Failed to get metadata");
+    assert!(metadata.len() > 0, "DOCX file must not be empty");
+
+    let file = File::open(&docx_path).expect("Failed to open DOCX");
+    let mut archive = zip::ZipArchive::new(file).expect("Failed to parse zip archive");
+    assert!(
+        archive.by_name("word/document.xml").is_ok(),
+        "document.xml must exist"
+    );
+
+    let mut doc_xml_entry = archive
+        .by_name("word/document.xml")
+        .expect("word/document.xml must exist");
+    let mut xml_content = String::new();
+    doc_xml_entry
+        .read_to_string(&mut xml_content)
+        .expect("Failed to read document.xml");
+    assert!(
+        xml_content.contains("drawing") || xml_content.contains("pic"),
+        "DOCX should contain drawing/pic element"
+    );
+
+    let _ = fs::remove_file(&docx_path);
+}
+
+#[test]
+fn test_export_pptx_with_images() {
+    let temp_dir = std::env::temp_dir();
+    let pptx_path = temp_dir.join("test_pptx_with_images.pptx");
+
+    let tiny_png = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
+        6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192,
+        240, 31, 0, 5, 0, 1, 255, 137, 91, 38, 59, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    let page = PageLayout {
+        page_index: 0,
+        width: 612.0,
+        height: 792.0,
+        lines: vec![],
+        images: vec![PageImage {
+            bytes: tiny_png,
+            bounds: (50.0, 500.0, 150.0, 600.0),
+            width_pt: 100.0,
+            height_pt: 100.0,
+        }],
+    };
+
+    let doc = DocumentLayout { pages: vec![page] };
+
+    export_pptx(&doc, &pptx_path).expect("PPTX export with image failed");
+    assert!(pptx_path.exists());
+    let metadata = fs::metadata(&pptx_path).expect("Failed to get metadata");
+    assert!(metadata.len() > 0, "PPTX file must not be empty");
+
+    let file = File::open(&pptx_path).expect("Failed to open PPTX");
+    let mut archive = zip::ZipArchive::new(file).expect("Failed to parse zip archive");
+    assert!(
+        archive.by_name("ppt/slides/slide1.xml").is_ok(),
+        "slide1.xml must exist"
+    );
+    assert!(
+        archive.by_name("ppt/media/image_1_1.png").is_ok(),
+        "ppt/media/image_1_1.png must exist"
+    );
+    assert!(
+        archive.by_name("ppt/slides/_rels/slide1.xml.rels").is_ok(),
+        "slide1.xml.rels must exist"
+    );
+
+    let mut slide_xml = String::new();
+    archive
+        .by_name("ppt/slides/slide1.xml")
+        .expect("slide1.xml must exist")
+        .read_to_string(&mut slide_xml)
+        .expect("Failed to read slide1.xml");
+    assert!(
+        slide_xml.contains("<p:pic>"),
+        "Slide should contain <p:pic> element"
+    );
+
+    let _ = fs::remove_file(&pptx_path);
+}
+
+#[test]
+fn test_export_xlsx_with_images() {
+    let temp_dir = std::env::temp_dir();
+    let xlsx_path = temp_dir.join("test_xlsx_with_images.xlsx");
+
+    let tiny_png = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
+        6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192,
+        240, 31, 0, 5, 0, 1, 255, 137, 91, 38, 59, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    let page = PageLayout {
+        page_index: 0,
+        width: 612.0,
+        height: 792.0,
+        lines: vec![],
+        images: vec![PageImage {
+            bytes: tiny_png,
+            bounds: (50.0, 500.0, 150.0, 600.0),
+            width_pt: 100.0,
+            height_pt: 100.0,
+        }],
+    };
+
+    let doc = DocumentLayout { pages: vec![page] };
+
+    export_xlsx(&doc, &xlsx_path).expect("XLSX export with image failed");
+    assert!(xlsx_path.exists());
+    let metadata = fs::metadata(&xlsx_path).expect("Failed to get metadata");
+    assert!(metadata.len() > 0, "XLSX file must not be empty");
+
+    let file = File::open(&xlsx_path).expect("Failed to open XLSX");
+    let archive = zip::ZipArchive::new(file).expect("Failed to parse zip archive");
+    // In OpenXML XLSX, inserted images produce a drawing relationship or xl/media/image1.png
+    let has_image = archive
+        .file_names()
+        .any(|name| name.contains("drawing") || name.contains("media") || name.contains("image"));
+    assert!(has_image, "XLSX should contain drawing or media image entries");
+
+    let _ = fs::remove_file(&xlsx_path);
 }

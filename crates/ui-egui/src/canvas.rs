@@ -661,6 +661,8 @@ pub struct DocView {
     pub canvas_selection: crate::canvas_selection::SelectionState,
     /// Whether vector line editing mode is active.
     pub vector_edit_mode: bool,
+    /// When true, dragging a line also extends/contracts touching perpendicular lines (Excel grid mode).
+    pub extend_perpendicular_lines: bool,
     /// Local state for vector line property editing panel.
     pub line_properties: LinePropertiesState,
     /// Active vector line endpoint/move drag: `(handle, current_user_coord, start_user_coord)`.
@@ -953,6 +955,7 @@ impl DocView {
             fill_text: None,
             canvas_selection: Default::default(),
             vector_edit_mode: false,
+            extend_perpendicular_lines: false,
             line_properties: Default::default(),
             line_drag: None,
             barcode_hud: Default::default(),
@@ -1158,6 +1161,7 @@ impl DocView {
         }
         self.slow_pages.remove(&page);
         self.texts.remove(&page);
+        self.vector_lines.remove(&page);
         self.text_failed.remove(&page);
         self.errors.remove(&page);
         self.last_queue.clear();
@@ -3827,7 +3831,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
 
                     if let Some(handle) = line_handle_hit {
                         ui.ctx().set_cursor_icon(handle.cursor_icon());
-                        if resp.drag_started() || (resp.clicked() && view.line_drag.is_none()) {
+                        if resp.drag_started() {
                             let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
                             view.line_drag = Some((handle, user_p, user_p));
                             view.canvas_selection.active_handle = Some(handle);
@@ -3859,6 +3863,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                                     _ => (line.start, line.end),
                                 };
                                 if (new_start[0] - new_end[0]).hypot(new_start[1] - new_end[1]) > 1e-4 {
+                                    let orig_start = line.start;
+                                    let orig_end = line.end;
                                     line.start = new_start;
                                     line.end = new_end;
                                     sel.user_rect = [
@@ -3867,16 +3873,58 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                                         new_start[0].max(new_end[0]),
                                         new_start[1].max(new_end[1]),
                                     ];
+                                    if let Some((_, lines)) = view.vector_lines.get_mut(&i)
+                                        && let Some(l) = lines.iter_mut().find(|l| l.index == line.index)
+                                    {
+                                        l.start = new_start;
+                                        l.end = new_end;
+                                    }
                                     let target = pdfcraft_engine::ObjectTarget {
                                         kind: pdfcraft_engine::ObjectKind::VectorLine,
                                         index: line.index,
                                     };
-                                    view.pending_edit = Some(Edit::UpdateLineEndpoints {
+                                    let mut edits = vec![Edit::UpdateLineEndpoints {
                                         page: i,
                                         target,
                                         new_start,
                                         new_end,
-                                    });
+                                    }];
+
+                                    if view.extend_perpendicular_lines
+                                        && let Some((_, lines)) = view.vector_lines.get(&i)
+                                    {
+                                        let updates = crate::canvas_selection::compute_connected_perpendicular_line_updates(
+                                            lines,
+                                            line.index,
+                                            orig_start,
+                                            orig_end,
+                                            new_start,
+                                            new_end,
+                                        );
+                                        if let Some((_, cached_lines)) = view.vector_lines.get_mut(&i) {
+                                            for up in updates {
+                                                if let Some(cl) = cached_lines.iter_mut().find(|l| l.index == up.index) {
+                                                    cl.start = up.new_start;
+                                                    cl.end = up.new_end;
+                                                }
+                                                edits.push(Edit::UpdateLineEndpoints {
+                                                    page: i,
+                                                    target: up.target,
+                                                    new_start: up.new_start,
+                                                    new_end: up.new_end,
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if edits.len() == 1 {
+                                        view.pending_edit = edits.pop();
+                                    } else {
+                                        view.pending_edit = Some(Edit::Batch {
+                                            label: "Adjust grid lines".to_string(),
+                                            edits,
+                                        });
+                                    }
                                 }
                             }
                             view.line_drag = None;
@@ -4006,6 +4054,36 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     info,
                 );
                 crate::canvas_selection::paint_line_endpoint_handles(painter, &preview_line, &xf, info, 7.0);
+
+                if view.extend_perpendicular_lines
+                    && view.line_drag.is_some()
+                    && let Some((_, lines)) = view.vector_lines.get(&i)
+                {
+                    let updates = crate::canvas_selection::compute_connected_perpendicular_line_updates(
+                        lines,
+                        line.index,
+                        line.start,
+                        line.end,
+                        preview_line.start,
+                        preview_line.end,
+                    );
+                    for up in updates {
+                        let conn_line = pdfcraft_engine::LineSegment {
+                            page: i,
+                            index: up.index,
+                            start: up.new_start,
+                            end: up.new_end,
+                            thickness: 1.0,
+                        };
+                        crate::canvas_selection::paint_line_highlight(
+                            painter,
+                            &conn_line,
+                            crate::canvas_selection::LineHighlightState::Hover,
+                            &xf,
+                            info,
+                        );
+                    }
+                }
             }
             for sel in &view.canvas_selection.multi_selected {
                 if sel.page == i
@@ -5811,6 +5889,19 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                             v.vector_edit_mode = !v.vector_edit_mode;
                             if v.vector_edit_mode {
                                 app.quick_tool = QuickTool::Select;
+                            }
+                        }
+                        if vector_active {
+                            let extend = app.views.get(tab_idx).is_some_and(|v| v.extend_perpendicular_lines);
+                            let tooltip = if extend {
+                                tl!("Connected lines: On (Excel grid mode) - click for Individual drag")
+                            } else {
+                                tl!("Connected lines: Off (Individual drag) - click for Excel grid mode")
+                            };
+                            if icons::button(ui, "grid-3x3", 32.0, extend, tooltip).clicked()
+                                && let Some(v) = app.views.get_mut(tab_idx)
+                            {
+                                v.extend_perpendicular_lines = !v.extend_perpendicular_lines;
                             }
                         }
                     }

@@ -28,6 +28,10 @@ pub struct BarcodeHudState {
     pub panel_open: bool,
     /// In-progress text string when editing a code.
     pub edit_buffer: Option<String>,
+    /// Selected symbology when re-embedding / replacing a code.
+    pub reembed_kind: Option<pdfcraft_engine::barcode_scan::CodeKind>,
+    /// Selected symbology when generating a new code.
+    pub generate_kind: pdfcraft_engine::barcode_scan::CodeKind,
     /// Feedback banner timestamp: `(message, expiry_time)`.
     pub toast: Option<(String, f64)>,
     /// Text or URL payload for generating a new QR code.
@@ -194,7 +198,8 @@ fn safe_rect_and_pixels(
         let side = pw.max(ph).max(64);
         (side, side)
     } else {
-        (pw.max(64), ph.max(24))
+        let h = if ph >= pw { (pw / 3).max(24) } else { ph.max(24) };
+        (pw.max(64), h)
     };
     (whiteout_rect, new_image_rect, pw, ph)
 }
@@ -528,15 +533,33 @@ impl BarcodeScannerHud {
                                         // Payload View or Edit Mode
                                         if let Some(buf) = &mut state.edit_buffer {
                                             ui.label(
-                                                egui::RichText::new("EDIT PAYLOAD (100% RE-EMBED)").font(theme::semibold(9.5)).color(text_muted),
+                                                egui::RichText::new("EDIT PAYLOAD & SYMBOLOGY").font(theme::semibold(9.5)).color(text_muted),
                                             );
                                             ui.add_space(3.0);
                                             ui.add(egui::TextEdit::multiline(buf).desired_width(ui.available_width()).desired_rows(3));
+                                            ui.add_space(4.0);
+
+                                            // Symbology Dropdown
+                                            let mut selected_kind = state.reembed_kind.unwrap_or(active.kind);
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Format:").font(theme::medium(11.0)).color(text_muted));
+                                                egui::ComboBox::from_id_salt("reembed-symbology-dropdown")
+                                                    .selected_text(selected_kind.label())
+                                                    .width(180.0)
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(&mut selected_kind, pdfcraft_engine::barcode_scan::CodeKind::QrCode, "QR Code");
+                                                        ui.selectable_value(&mut selected_kind, pdfcraft_engine::barcode_scan::CodeKind::Code39, "Code 39 Barcode (139)");
+                                                        ui.selectable_value(&mut selected_kind, pdfcraft_engine::barcode_scan::CodeKind::Code128, "Code 128 Barcode");
+                                                        ui.selectable_value(&mut selected_kind, pdfcraft_engine::barcode_scan::CodeKind::Ean13, "EAN-13 Barcode");
+                                                    });
+                                            });
+                                            state.reembed_kind = Some(selected_kind);
+
                                             ui.add_space(8.0);
                                             ui.horizontal(|ui| {
                                                 let can_apply = can_modify && !buf.trim().is_empty();
                                                 if ui.add_enabled(can_apply, egui::Button::new("⚡ Re-embed")).clicked() {
-                                                    apply_code = Some((active.clone(), buf.clone()));
+                                                    apply_code = Some((active.clone(), buf.clone(), selected_kind));
                                                 }
                                                 if ui.button("Cancel").clicked() {
                                                     cancel_edit = true;
@@ -578,19 +601,40 @@ impl BarcodeScannerHud {
                                     });
                             }
 
-                            // Section 3: Collapsible "Generate New QR" Section
+                            // Section 3: Collapsible "Generate New QR / Barcode" Section
                             ui.add_space(8.0);
-                            ui.collapsing("Generate New QR Code", |ui| {
+                            ui.collapsing("Generate New QR / Barcode", |ui| {
                                 ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Type:").font(theme::medium(11.0)).color(text_muted));
+                                    egui::ComboBox::from_id_salt("generate-code-type-dropdown")
+                                        .selected_text(state.generate_kind.label())
+                                        .width(180.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::QrCode, "QR Code");
+                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code39, "Code 39 Barcode (139)");
+                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code128, "Code 128 Barcode");
+                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Ean13, "EAN-13 Barcode");
+                                        });
+                                });
+                                ui.add_space(4.0);
+                                let hint = match state.generate_kind {
+                                    pdfcraft_engine::barcode_scan::CodeKind::QrCode => "https://example.com or text...",
+                                    pdfcraft_engine::barcode_scan::CodeKind::Code39 => "ALPHANUMERIC (e.g. CODE39)",
+                                    pdfcraft_engine::barcode_scan::CodeKind::Code128 => "Any ASCII text...",
+                                    pdfcraft_engine::barcode_scan::CodeKind::Ean13 => "12 or 13 digits (e.g. 590123412345)",
+                                    _ => "Enter payload...",
+                                };
                                 ui.add(
                                     egui::TextEdit::multiline(&mut state.qr_input)
                                         .desired_width(ui.available_width())
                                         .desired_rows(2)
-                                        .hint_text("https://example.com or text..."),
+                                        .hint_text(hint),
                                 );
                                 ui.add_space(6.0);
                                 let can_gen = can_modify && !state.qr_input.trim().is_empty();
-                                if ui.add_enabled(can_gen, egui::Button::new("⚡ Embed QR on Page")).clicked() {
+                                let btn_label = format!("⚡ Embed {} on Page", state.generate_kind.label());
+                                if ui.add_enabled(can_gen, egui::Button::new(btn_label)).clicked() {
                                     trigger_generate = true;
                                 }
                             });
@@ -616,17 +660,19 @@ impl BarcodeScannerHud {
         }
         if cancel_edit {
             state.edit_buffer = None;
+            state.reembed_kind = None;
         }
-        if start_edit && let Some(active) = state.active_code() {
-            state.edit_buffer = Some(active.text.clone());
+        if start_edit && let Some((text, kind)) = state.active_code().map(|c| (c.text.clone(), c.kind)) {
+            state.edit_buffer = Some(text);
+            state.reembed_kind = Some(kind);
         }
-        if let Some((active, buf)) = apply_code {
+        if let Some((active, buf, kind)) = apply_code {
             let (whiteout_rect, new_image_rect, pw, ph) =
-                safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), Some(&buf));
+                safe_rect_and_pixels(active.rect, active.pixel_size, kind, Some(&active.text), Some(&buf));
             let (edit_whiteout, edit_image) =
                 (display_rect(whiteout_rect, Some(info), current_page), display_rect(new_image_rect, Some(info), current_page));
 
-            match Document::generate_replacement_code(active.kind, &buf, pw, ph) {
+            match Document::generate_replacement_code(kind, &buf, pw, ph) {
                 Ok(png_bytes) => {
                     // Two-step overlay: first whiteout the old code, then place new code over active.rect
                     let whiteout_bytes = Document::generate_whiteout(pw, ph).unwrap_or_default();
@@ -658,6 +704,7 @@ impl BarcodeScannerHud {
                     state.target_rect = Some(new_image_rect);
                     state.last_scanned_page = None;
                     state.edit_buffer = None;
+                    state.reembed_kind = None;
                     state.show_toast(format!("Replaced at 100% dimensions ({}×{}px)!", pw, ph), now);
                 }
                 Err(e) => {
@@ -742,20 +789,31 @@ impl BarcodeScannerHud {
 
         if trigger_generate {
             let text = state.qr_input.trim();
-            match Document::generate_replacement_code(pdfcraft_engine::barcode_scan::CodeKind::QrCode, text, 240, 240) {
+            let kind = state.generate_kind;
+            let (pw, ph, rect_w, rect_h) = match kind {
+                pdfcraft_engine::barcode_scan::CodeKind::QrCode => (240, 240, 144.0, 144.0),
+                _ => (360, 120, 216.0, 72.0),
+            };
+            match Document::generate_replacement_code(kind, text, pw, ph) {
                 Ok(png_bytes) => {
                     let (page_w, page_h) = info.pages.get(current_page).map(|p| (p.width as f64, p.height as f64)).unwrap_or((612.0, 792.0));
-                    let qr_size = 144.0;
-                    let x = (page_w - qr_size) * 0.5;
-                    let y = (page_h - qr_size) * 0.5;
-                    let rect = [x, y, x + qr_size, y + qr_size];
+                    let x = (page_w - rect_w) * 0.5;
+                    let y = (page_h - rect_h) * 0.5;
+                    let rect = [x, y, x + rect_w, y + rect_h];
+                    let filename = match kind {
+                        pdfcraft_engine::barcode_scan::CodeKind::QrCode => "QRCode.png",
+                        pdfcraft_engine::barcode_scan::CodeKind::Code39 => "Code39.png",
+                        pdfcraft_engine::barcode_scan::CodeKind::Code128 => "Code128.png",
+                        pdfcraft_engine::barcode_scan::CodeKind::Ean13 => "EAN13.png",
+                        _ => "Barcode.png",
+                    };
 
                     pending_edit =
-                        Some(Edit::AddImage { page: current_page, rect: Some(rect), name: "QRCode.png".into(), bytes: Arc::new(png_bytes) });
-                    state.show_toast("QR code placed on page!".into(), now);
+                        Some(Edit::AddImage { page: current_page, rect: Some(rect), name: filename.into(), bytes: Arc::new(png_bytes) });
+                    state.show_toast(format!("{} placed on page!", kind.label()), now);
                 }
                 Err(e) => {
-                    state.show_toast(format!("QR generation error: {e}"), now);
+                    state.show_toast(format!("Generation error: {e}"), now);
                 }
             }
         }

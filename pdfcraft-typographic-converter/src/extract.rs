@@ -1,3 +1,4 @@
+use crate::layout::{ExtractedPageData, PageImage};
 use anyhow::{Context, Result};
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,15 @@ pub fn extract_glyphs<P: AsRef<Path>>(pdf_path: P) -> Result<Vec<RawGlyph>> {
 }
 
 /// Extracts glyphs grouped by page from a PDF file located at `pdf_path`.
+/// Extracts full page data (glyphs + embedded images like barcodes/QRs) grouped by page.
+pub fn extract_pages_full<P: AsRef<Path>>(
+    pdf_path: P,
+) -> Result<Vec<ExtractedPageData>> {
+    let pdfium = init_pdfium()?;
+    extract_pages_full_with_pdfium(&pdfium, pdf_path)
+}
+
+/// Extracts glyphs grouped by page from a PDF file located at `pdf_path`.
 /// Returns `Vec<(page_index, width, height, Vec<RawGlyph>)>`.
 #[allow(clippy::type_complexity)]
 pub fn extract_pages<P: AsRef<Path>>(
@@ -116,6 +126,18 @@ pub fn extract_pages_with_pdfium<P: AsRef<Path>>(
     pdfium: &Pdfium,
     pdf_path: P,
 ) -> Result<Vec<(usize, f32, f32, Vec<RawGlyph>)>> {
+    let pages = extract_pages_full_with_pdfium(pdfium, pdf_path)?;
+    Ok(pages
+        .into_iter()
+        .map(|p| (p.page_index, p.width, p.height, p.glyphs))
+        .collect())
+}
+
+/// Extracts full page data (glyphs + images) grouped by page using an existing `Pdfium` instance.
+pub fn extract_pages_full_with_pdfium<P: AsRef<Path>>(
+    pdfium: &Pdfium,
+    pdf_path: P,
+) -> Result<Vec<ExtractedPageData>> {
     let path_ref = pdf_path.as_ref();
     if !path_ref.exists() {
         anyhow::bail!("Input PDF file not found: {}", path_ref.display());
@@ -132,48 +154,102 @@ pub fn extract_pages_with_pdfium<P: AsRef<Path>>(
         let width = page.width().value;
         let height = page.height().value;
 
-        // Gracefully handle empty pages or pages where text cannot be initialized
-        let text_page = match page.text() {
-            Ok(tp) => tp,
-            Err(_) => {
-                // Page has no text stream; preserve empty page in layout
-                pages_result.push((page_index, width, height, Vec::new()));
-                continue;
-            }
-        };
-
         let page_objects = page.objects();
         let mut page_glyphs = Vec::new();
+        let mut page_images = Vec::new();
         let mut found_text_object = false;
 
-        // Iterate across text objects on the page
+        // Extract text and image objects on this page
+        let text_page_opt = page.text().ok();
+
         for object in page_objects.iter() {
             if let Some(text_object) = object.as_text_object() {
                 found_text_object = true;
 
-                // Attempt to extract characters associated with this specific text object
-                if let Ok(chars) = text_page.chars_for_object(text_object) {
-                    for ch in chars.iter() {
-                        let glyph = extract_single_glyph(&ch, Some(text_object));
-                        page_glyphs.push(glyph);
+                if let Some(ref text_page) = text_page_opt {
+                    if let Ok(chars) = text_page.chars_for_object(text_object) {
+                        for ch in chars.iter() {
+                            let glyph = extract_single_glyph(&ch, Some(text_object));
+                            page_glyphs.push(glyph);
+                        }
                     }
+                }
+            } else if let Some(image_object) = object.as_image_object() {
+                // Extract image object (barcodes, QR codes, illustrations, etc.)
+                let raw_data = image_object.get_raw_image_data().unwrap_or_default();
+                let (left, top, right, bottom) = match object.bounds() {
+                    Ok(quad) => {
+                        let r = quad.to_rect();
+                        (r.left().value, r.top().value, r.right().value, r.bottom().value)
+                    }
+                    Err(_) => (0.0, 0.0, 0.0, 0.0),
+                };
+                let width_pt = (right - left).abs();
+                let height_pt = (top - bottom).abs();
+
+                let mut bytes = raw_data;
+                let is_png = bytes.starts_with(&[0x89, b'P', b'N', b'G']);
+                let is_jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+
+                if !is_png && !is_jpeg {
+                    if let Ok(bitmap) = image_object.get_processed_bitmap(&document) {
+                        let w = bitmap.width() as u32;
+                        let h = bitmap.height() as u32;
+                        if w > 0 && h > 0 {
+                            let rgba = bitmap.as_rgba_bytes();
+                            if let Ok(png_data) = encode_png_exact(w, h, &rgba) {
+                                bytes = png_data;
+                            }
+                        }
+                    }
+                }
+
+                if !bytes.is_empty() {
+                    page_images.push(PageImage {
+                        bytes,
+                        bounds: (left, top, right, bottom),
+                        width_pt,
+                        height_pt,
+                    });
                 }
             }
         }
 
         // Fallback: If no text objects were found on the page, or if text objects
         // yielded no glyphs while text_page has characters, extract them directly from text_page.
-        if (!found_text_object || page_glyphs.is_empty()) && !text_page.is_empty() {
-            for ch in text_page.chars().iter() {
-                let glyph = extract_single_glyph(&ch, None);
-                page_glyphs.push(glyph);
+        if !found_text_object || page_glyphs.is_empty() {
+            if let Some(ref text_page) = text_page_opt {
+                if !text_page.is_empty() {
+                    for ch in text_page.chars().iter() {
+                        let glyph = extract_single_glyph(&ch, None);
+                        page_glyphs.push(glyph);
+                    }
+                }
             }
         }
 
-        pages_result.push((page_index, width, height, page_glyphs));
+        pages_result.push(ExtractedPageData {
+            page_index,
+            width,
+            height,
+            glyphs: page_glyphs,
+            images: page_images,
+        });
     }
 
     Ok(pages_result)
+}
+
+/// Encode RGBA buffer into a PNG byte stream using the `png` crate.
+fn encode_png_exact(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(rgba).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// Extracts all required typographic attributes for a single character glyph.

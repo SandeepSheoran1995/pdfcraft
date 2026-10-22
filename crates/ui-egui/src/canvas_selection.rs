@@ -750,8 +750,12 @@ pub fn paint_line_highlight(painter: &egui::Painter, line: &LineSegment, state: 
 }
 
 pub fn project_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: [f64; 2]) -> Pos2 {
-    // ADAPT: PageXform::user_rect projection (crates/ui-egui/src/canvas.rs:2280)
-    xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32 + 1.0, p[1] as f32 + 1.0]).min
+    if let Some(page_info) = info.pages.get(page) {
+        let [vx, vy] = page_info.user_to_view(p[0] as f32, p[1] as f32);
+        xf.norm_to_screen(vx / xf.pw.max(1e-3), vy / xf.ph.max(1e-3))
+    } else {
+        xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32 + 1.0, p[1] as f32 + 1.0]).min
+    }
 }
 
 /// Screen-space rectangles for the two endpoint handles of a line.
@@ -794,6 +798,127 @@ pub fn screen_to_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: Pos2
     } else {
         [0.0, 0.0]
     }
+}
+
+/// An update to a line's endpoints on the page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineUpdate {
+    pub index: usize,
+    pub target: pdfcraft_engine::ObjectTarget,
+    pub new_start: [f64; 2],
+    pub new_end: [f64; 2],
+}
+
+/// Computes updates for touching perpendicular lines when `dragged_line` moves from `orig_start` and `orig_end`
+/// to `new_start` and `new_end`.
+///
+/// If a line is perpendicular and one of its endpoints touches the dragged line (within a 4.0pt tolerance),
+/// that touching endpoint extends or contracts with the movement of the dragged line, maintaining grid border continuity.
+pub fn compute_connected_perpendicular_line_updates(
+    lines: &[LineSegment],
+    dragged_index: usize,
+    orig_start: [f64; 2],
+    orig_end: [f64; 2],
+    new_start: [f64; 2],
+    new_end: [f64; 2],
+) -> Vec<LineUpdate> {
+    let mut updates = Vec::new();
+    let dx = ((new_start[0] - orig_start[0]) + (new_end[0] - orig_end[0])) * 0.5;
+    let dy = ((new_start[1] - orig_start[1]) + (new_end[1] - orig_end[1])) * 0.5;
+
+    if dx.abs() < 1e-5 && dy.abs() < 1e-5 {
+        return updates;
+    }
+
+    let orig_dx = (orig_end[0] - orig_start[0]).abs();
+    let orig_dy = (orig_end[1] - orig_start[1]).abs();
+    let tol = 4.0;
+
+    let is_horizontal = orig_dx >= orig_dy;
+    let is_vertical = orig_dy >= orig_dx;
+
+    for line in lines {
+        if line.index == dragged_index {
+            continue;
+        }
+
+        let l_dx = (line.end[0] - line.start[0]).abs();
+        let l_dy = (line.end[1] - line.start[1]).abs();
+
+        if is_horizontal {
+            // Dragged line is predominantly horizontal. Perpendicular lines are vertical.
+            if l_dy > l_dx {
+                let x_min = orig_start[0].min(orig_end[0]) - tol;
+                let x_max = orig_start[0].max(orig_end[0]) + tol;
+                let y_ref = (orig_start[1] + orig_end[1]) * 0.5;
+
+                let mut modified = false;
+                let mut updated_start = line.start;
+                let mut updated_end = line.end;
+
+                if (line.start[1] - y_ref).abs() <= tol && line.start[0] >= x_min && line.start[0] <= x_max {
+                    updated_start[1] += dy;
+                    modified = true;
+                }
+                if (line.end[1] - y_ref).abs() <= tol && line.end[0] >= x_min && line.end[0] <= x_max {
+                    updated_end[1] += dy;
+                    modified = true;
+                }
+
+                if modified {
+                    let len = (updated_start[0] - updated_end[0]).hypot(updated_start[1] - updated_end[1]);
+                    if len > 0.5 {
+                        updates.push(LineUpdate {
+                            index: line.index,
+                            target: pdfcraft_engine::ObjectTarget {
+                                kind: pdfcraft_engine::ObjectKind::VectorLine,
+                                index: line.index,
+                            },
+                            new_start: updated_start,
+                            new_end: updated_end,
+                        });
+                    }
+                }
+            }
+        } else if is_vertical {
+            // Dragged line is predominantly vertical. Perpendicular lines are horizontal.
+            if l_dx > l_dy {
+                let y_min = orig_start[1].min(orig_end[1]) - tol;
+                let y_max = orig_start[1].max(orig_end[1]) + tol;
+                let x_ref = (orig_start[0] + orig_end[0]) * 0.5;
+
+                let mut modified = false;
+                let mut updated_start = line.start;
+                let mut updated_end = line.end;
+
+                if (line.start[0] - x_ref).abs() <= tol && line.start[1] >= y_min && line.start[1] <= y_max {
+                    updated_start[0] += dx;
+                    modified = true;
+                }
+                if (line.end[0] - x_ref).abs() <= tol && line.end[1] >= y_min && line.end[1] <= y_max {
+                    updated_end[0] += dx;
+                    modified = true;
+                }
+
+                if modified {
+                    let len = (updated_start[0] - updated_end[0]).hypot(updated_start[1] - updated_end[1]);
+                    if len > 0.5 {
+                        updates.push(LineUpdate {
+                            index: line.index,
+                            target: pdfcraft_engine::ObjectTarget {
+                                kind: pdfcraft_engine::ObjectKind::VectorLine,
+                                index: line.index,
+                            },
+                            new_start: updated_start,
+                            new_end: updated_end,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    updates
 }
 
 #[cfg(test)]
@@ -926,5 +1051,59 @@ mod tests {
         // Clamping to MIN_SIZE
         let r_clamped = SelectionHandle::Right.resize_rect(rect, vec2(-200.0, 0.0));
         assert!(r_clamped.width() >= 10.0);
+    }
+
+    #[test]
+    fn test_connected_perpendicular_lines_grid_adjustment() {
+        // Vertical column line at x = 100
+        let col = LineSegment {
+            page: 0,
+            index: 0,
+            start: [100.0, 50.0],
+            end: [100.0, 150.0],
+            thickness: 1.0,
+        };
+        // Horizontal row line touching col from left: end at (100, 80)
+        let row_left = LineSegment {
+            page: 0,
+            index: 1,
+            start: [50.0, 80.0],
+            end: [100.0, 80.0],
+            thickness: 1.0,
+        };
+        // Horizontal row line touching col from right: start at (100, 80)
+        let row_right = LineSegment {
+            page: 0,
+            index: 2,
+            start: [100.0, 80.0],
+            end: [180.0, 80.0],
+            thickness: 1.0,
+        };
+        // An unrelated line far away
+        let row_far = LineSegment {
+            page: 0,
+            index: 3,
+            start: [20.0, 20.0],
+            end: [40.0, 20.0],
+            thickness: 1.0,
+        };
+
+        let lines = vec![col.clone(), row_left, row_right, row_far];
+
+        // Drag column line right by +25.0pt (from x=100 to x=125)
+        let new_start = [125.0, 50.0];
+        let new_end = [125.0, 150.0];
+
+        let updates = compute_connected_perpendicular_line_updates(&lines, 0, col.start, col.end, new_start, new_end);
+
+        assert_eq!(updates.len(), 2, "Both touching perpendicular row lines should be updated");
+
+        let left_up = updates.iter().find(|u| u.index == 1).expect("row_left update must exist");
+        assert_eq!(left_up.new_start, [50.0, 80.0]);
+        assert_eq!(left_up.new_end, [125.0, 80.0], "row_left should extend its end to x=125");
+
+        let right_up = updates.iter().find(|u| u.index == 2).expect("row_right update must exist");
+        assert_eq!(right_up.new_start, [125.0, 80.0], "row_right should shift its start to x=125");
+        assert_eq!(right_up.new_end, [180.0, 80.0]);
     }
 }

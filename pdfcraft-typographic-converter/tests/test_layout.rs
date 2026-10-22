@@ -1,6 +1,7 @@
 use pdf_typographic_converter::layout::{build_layout, ScriptType};
 use pdf_typographic_converter::extract::RawGlyph;
 
+#[allow(clippy::too_many_arguments)]
 fn make_glyph(
     char_code: char,
     font_name: &str,

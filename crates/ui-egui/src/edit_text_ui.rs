@@ -1397,7 +1397,7 @@ fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32
     // An unchanged PDF row or single-line text already has an authoritative line break or flows horizontally.
     // Do not wrap single-line entries down onto adjacent rows.
     let is_single_line = !ed.multiline && !text.contains('\n');
-    job.wrap.max_width = if is_single_line || (text == ed.original && ed.look == ed.look0 && ed.extras == ed.extras0) {
+    job.wrap.max_width = if (is_single_line && width.is_infinite()) || (text == ed.original && ed.look == ed.look0 && ed.extras == ed.extras0) {
         f32::INFINITY
     } else {
         width
@@ -1632,10 +1632,11 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             } else {
                 ed.rect.width().max(1.0)
             };
-            ui.set_width(width);
             let measured = editor_galley(ui, ed, &ed.text, scale, width);
+            let edit_width = width.max(measured.rect.width());
+            ui.set_width(edit_width);
             ed.overflow = ed.has_changes() && (measured.rect.width() > ed.rect.width() + 1.5 || measured.rect.height() > ed.rect.height() + 1.5);
-            let visible = Rect::from_min_size(ed.rect.min, egui::vec2(width.max(measured.rect.width()), measured.rect.height().max(1.0)));
+            let visible = Rect::from_min_size(ed.rect.min, egui::vec2(edit_width, measured.rect.height().max(1.0)));
             // Unsupported source programs use an interface fallback whose glyph advances
             // can differ from the PDF's. Keep every visible row inside the growing frame.
             let live = draft_rect.map_or(visible, |bounds| bounds.union(visible));
@@ -1669,7 +1670,7 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
                 } else {
                     caret_color_on(fill)
                 };
-                let rows = 1;
+                let rows = measured.rows.len().max(ed.text.lines().count()).max(1);
                 let snapshot = ed.clone();
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
                     let galley = editor_galley(ui, &snapshot, text.as_str(), scale, wrap_width);
@@ -1682,8 +1683,9 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
                     .layouter(&mut layouter)
                     .text_color(text_color)
                     .frame(egui::Frame::NONE)
-                    .desired_width(width)
+                    .desired_width(edit_width)
                     .desired_rows(rows)
+                    .clip_text(false)
                     .show(ui);
                 if ed.has_changes() {
                     if background_ready {

@@ -47,7 +47,7 @@ fn print_usage(program_name: &str) {
 fn main() {
     let start_time = Instant::now();
     let args: Vec<String> = env::args().collect();
-    let program_name = args.get(0).map(String::as_str).unwrap_or("pdf-typographic-converter");
+    let program_name = args.first().map(String::as_str).unwrap_or("pdf-typographic-converter");
 
     if args.len() < 2 {
         print_usage(program_name);
@@ -123,15 +123,15 @@ fn main() {
                 process::exit(1);
             }
             arg => {
-                if pdf_path.is_none() {
-                    pdf_path = Some(PathBuf::from(arg));
-                } else {
+                if let Some(existing) = &pdf_path {
                     eprintln!(
                         "Error: Multiple file paths specified ('{}' and '{}').",
-                        pdf_path.as_ref().unwrap().display(),
+                        existing.display(),
                         arg
                     );
                     process::exit(1);
+                } else {
+                    pdf_path = Some(PathBuf::from(arg));
                 }
             }
         }

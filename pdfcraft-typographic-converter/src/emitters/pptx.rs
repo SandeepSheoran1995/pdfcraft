@@ -39,6 +39,7 @@ pub fn export_pptx(doc: &DocumentLayout, output_path: &Path) -> Result<()> {
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
 "#,
     );
@@ -126,6 +127,7 @@ pub fn export_pptx(doc: &DocumentLayout, output_path: &Path) -> Result<()> {
             width: 792.0,
             height: 612.0,
             lines: Vec::new(),
+            images: Vec::new(),
         }]
     } else {
         doc.pages.clone()
@@ -230,6 +232,76 @@ pub fn export_pptx(doc: &DocumentLayout, output_path: &Path) -> Result<()> {
       </p:sp>
 "#,
             );
+        }
+
+        // Emit images (including barcodes and QR codes)
+        if !page.images.is_empty() {
+            // Write slide relationships file
+            let rels_path = format!("ppt/slides/_rels/slide{}.xml.rels", slide_num);
+            let mut rels_xml = String::from(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+"#,
+            );
+
+            for (img_idx, img) in page.images.iter().enumerate() {
+                let img_filename = format!("image_{}_{}.png", slide_num, img_idx + 1);
+                let media_path = format!("ppt/media/{}", img_filename);
+
+                // Write PNG image bytes to archive
+                zip.start_file(&media_path, options)?;
+                zip.write_all(&img.bytes)?;
+
+                rels_xml.push_str(&format!(
+                    r#"  <Relationship Id="rIdImg{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{}"/>
+"#,
+                    img_idx + 1,
+                    img_filename
+                ));
+
+                let shape_id = page.lines.len() + 2 + img_idx;
+                let x = (img.bounds.0 * 12700.0).round() as i64;
+                let y = ((page.height - img.bounds.3) * 12700.0).round() as i64;
+                let cx = ((img.bounds.2 - img.bounds.0) * 12700.0)
+                    .max(100000.0)
+                    .round() as i64;
+                let cy = ((img.bounds.3 - img.bounds.1) * 12700.0)
+                    .max(100000.0)
+                    .round() as i64;
+
+                slide_xml.push_str(&format!(
+                    r#"      <p:pic>
+        <p:nvPicPr>
+          <p:cNvPr id="{shape_id}" name="Picture {shape_id}"/>
+          <p:cNvPicPr>
+            <a:picLocks noChangeAspect="1"/>
+          </p:cNvPicPr>
+          <p:nvPr/>
+        </p:nvPicPr>
+        <p:blipFill>
+          <a:blip r:embed="rIdImg{}"/>
+          <a:stretch>
+            <a:fillRect/>
+          </a:stretch>
+        </p:blipFill>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="{x}" y="{y}"/>
+            <a:ext cx="{cx}" cy="{cy}"/>
+          </a:xfrm>
+          <a:prstGeom prst="rect">
+            <a:avLst/>
+          </a:prstGeom>
+        </p:spPr>
+      </p:pic>
+"#,
+                    img_idx + 1
+                ));
+            }
+
+            rels_xml.push_str("</Relationships>");
+            zip.start_file(rels_path, options)?;
+            zip.write_all(rels_xml.as_bytes())?;
         }
 
         slide_xml.push_str(

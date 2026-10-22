@@ -32,6 +32,15 @@ pub struct TextLine {
     pub bounds: (f32, f32, f32, f32), // (min_x, min_y, max_x, max_y)
 }
 
+/// An extracted embedded image (such as a barcode, QR code, or picture).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageImage {
+    pub bytes: Vec<u8>,
+    pub bounds: (f32, f32, f32, f32), // (left, top, right, bottom)
+    pub width_pt: f32,
+    pub height_pt: f32,
+}
+
 /// Layout representation of an individual document page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PageLayout {
@@ -39,6 +48,41 @@ pub struct PageLayout {
     pub width: f32,
     pub height: f32,
     pub lines: Vec<TextLine>,
+    pub images: Vec<PageImage>,
+}
+
+/// Intermediate page data containing glyphs and extracted images.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedPageData {
+    pub page_index: usize,
+    pub width: f32,
+    pub height: f32,
+    pub glyphs: Vec<RawGlyph>,
+    pub images: Vec<PageImage>,
+}
+
+impl From<(usize, f32, f32, Vec<RawGlyph>)> for ExtractedPageData {
+    fn from((page_index, width, height, glyphs): (usize, f32, f32, Vec<RawGlyph>)) -> Self {
+        Self {
+            page_index,
+            width,
+            height,
+            glyphs,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<(usize, f32, f32, Vec<RawGlyph>, Vec<PageImage>)> for ExtractedPageData {
+    fn from((page_index, width, height, glyphs, images): (usize, f32, f32, Vec<RawGlyph>, Vec<PageImage>)) -> Self {
+        Self {
+            page_index,
+            width,
+            height,
+            glyphs,
+            images,
+        }
+    }
 }
 
 /// Structured document representation containing the layout of all pages.
@@ -62,19 +106,25 @@ fn calculate_median(values: &[f32]) -> f32 {
     }
 }
 
-/// Builds a structured `DocumentLayout` from per-page glyph collections.
+/// Builds a structured `DocumentLayout` from per-page glyph and image collections.
 ///
-/// Input tuples are `(page_index, width, height, glyphs)`.
-pub fn build_layout(page_glyphs: Vec<(usize, f32, f32, Vec<RawGlyph>)>) -> DocumentLayout {
-    let mut pages = Vec::with_capacity(page_glyphs.len());
+/// Accepts `Vec<(usize, f32, f32, Vec<RawGlyph>)>`,
+/// `Vec<(usize, f32, f32, Vec<RawGlyph>, Vec<PageImage>)>`, or `Vec<ExtractedPageData>`.
+pub fn build_layout<I>(page_data: Vec<I>) -> DocumentLayout
+where
+    I: Into<ExtractedPageData>,
+{
+    let mut pages = Vec::with_capacity(page_data.len());
 
-    for (page_index, width, height, glyphs) in page_glyphs {
-        let lines = build_page_lines(glyphs);
+    for item in page_data {
+        let p: ExtractedPageData = item.into();
+        let lines = build_page_lines(p.glyphs);
         pages.push(PageLayout {
-            page_index,
-            width,
-            height,
+            page_index: p.page_index,
+            width: p.width,
+            height: p.height,
             lines,
+            images: p.images,
         });
     }
 

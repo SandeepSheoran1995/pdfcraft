@@ -4103,6 +4103,7 @@ dependencies = [
  "anyhow",
  "docx-rs",
  "pdfium-render",
+ "png 0.17.16",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

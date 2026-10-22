@@ -11,8 +11,9 @@ use crate::Document;
 use crate::qr::QrCode;
 
 /// The recognized barcode or 2D matrix symbology.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CodeKind {
+    #[default]
     QrCode,
     Code128,
     Code39,

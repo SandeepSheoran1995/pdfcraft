@@ -37,10 +37,10 @@ pub fn export_pdf<P: AsRef<Path>, Q: AsRef<Path>>(
     let pdf_path_ref = pdf_path.as_ref();
     let output_path_ref = output_path.as_ref();
 
-    let page_glyphs = extract::extract_pages(pdf_path_ref)
+    let page_data = extract::extract_pages_full(pdf_path_ref)
         .map_err(|e| format!("Failed to extract pages from PDF at {}: {e:#}", pdf_path_ref.display()))?;
 
-    let document_layout = layout::build_layout(page_glyphs);
+    let document_layout = layout::build_layout(page_data);
 
     match format {
         ExportFormat::Docx => emitters::export_docx(&document_layout, output_path_ref)
