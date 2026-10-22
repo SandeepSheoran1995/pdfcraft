@@ -24,6 +24,8 @@ egui = { workspace = true }
 serde_json = { workspace = true }
 # Records from every crate go to standard error and the log file (src/logging.rs).
 log = { workspace = true }
+# The log timestamp goes through chrono (no hand-rolled calendar code).
+chrono = { workspace = true }
 pdf-typographic-converter = { version = "0.1.0", path = "../../pdfcraft-typographic-converter" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -71,4 +73,3 @@ uds_windows = "=1.2.1"
 [build-dependencies]
 # Icon + VERSIONINFO for pdfcraft.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
-
