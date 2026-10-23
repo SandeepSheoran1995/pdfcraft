@@ -48,7 +48,7 @@ impl SymbolPalette {
                 .show(ui, |ui| {
                     ui.set_width(280.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(tl!("Insert Symbol")).font(crate::theme::semibold(13.0)));
+                        ui.label(egui::RichText::new("Insert Symbol").font(crate::theme::semibold(13.0)));
                     });
                     ui.add_space(6.0);
 

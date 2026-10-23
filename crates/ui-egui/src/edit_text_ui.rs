@@ -239,6 +239,8 @@ pub struct LineEditor {
     pub(crate) fonts: BTreeMap<String, String>,
     /// The draft extends outside the source container; its frame follows the live draft bounds.
     pub overflow: bool,
+    /// Measured height of the editor's text galley in screen coordinates.
+    pub measured_h: f32,
     /// The initial source container width in screen pixels.
     pub max_width: f32,
     /// Current screen-space size. Recomputed from the current page transform before painting.
@@ -1190,6 +1192,7 @@ fn open_editor(
         source: Some((l.clone(), source_lines)),
         fonts: install_source_fonts(ui.ctx(), doc, page),
         overflow: false,
+        measured_h: b.height(),
         max_width,
         size: (l.size as f32 * scale).clamp(8.0, 72.0),
         focus: true,
@@ -1634,12 +1637,21 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             };
             let measured = editor_galley(ui, ed, &ed.text, scale, width);
             let edit_width = width.max(measured.rect.width());
+            ed.measured_h = measured.rect.height();
             ui.set_width(edit_width);
             ed.overflow = ed.has_changes() && (measured.rect.width() > ed.rect.width() + 1.5 || measured.rect.height() > ed.rect.height() + 1.5);
             let visible = Rect::from_min_size(ed.rect.min, egui::vec2(edit_width, measured.rect.height().max(1.0)));
             // Unsupported source programs use an interface fallback whose glyph advances
             // can differ from the PDF's. Keep every visible row inside the growing frame.
-            let live = draft_rect.map_or(visible, |bounds| bounds.union(visible));
+            let live = if let Some(bounds) = draft_rect {
+                if (bounds.width() - visible.width()).abs() < 2.0 && (bounds.height() - visible.height()).abs() < 2.0 {
+                    bounds
+                } else {
+                    bounds.union(visible)
+                }
+            } else {
+                visible
+            };
             ui.painter().rect_stroke(live.expand(2.0), CornerRadius::ZERO, Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
             // On the frame, a press takes hold of the box (a click selects it, a drag moves it):
             // the pointer says so there, and reads as text inside.
@@ -1731,14 +1743,15 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
                 return None;
             }
             view.applied_editor = Some(ed.clone());
-            finished_edit(ed)
+            let blocks = view.edit_lines.get(&ed.page).map(|(_, b)| b.as_slice());
+            finished_edit(ed, view.reflow_paragraphs, blocks)
         }
         None => None,
     }
 }
 
 /// The edit a closed paragraph editor applies, or `None` when nothing in it changed.
-pub(crate) fn finished_edit(ed: LineEditor) -> Option<Edit> {
+pub(crate) fn finished_edit(ed: LineEditor, reflow: bool, page_blocks: Option<&[pdfcraft_engine::TextBlock]>) -> Option<Edit> {
     let mut style = ed.style();
     let current_user_w = (ed.source_rect[2] - ed.source_rect[0]).abs() as f64;
     if current_user_w > 1.0 && style.width.is_none()
@@ -1749,12 +1762,51 @@ pub(crate) fn finished_edit(ed: LineEditor) -> Option<Edit> {
             style.width = Some(current_user_w);
         }
     }
-    (ed.text != ed.original || style != pdfcraft_engine::BlockStyle::default()).then_some(Edit::EditTextBlock {
+    let text_changed = ed.text != ed.original;
+    let style_changed = style != pdfcraft_engine::BlockStyle::default();
+    if !text_changed && !style_changed {
+        return None;
+    }
+
+    let edit = Edit::EditTextBlock {
         page: ed.page,
         block: ed.block,
         text: ed.text,
         style,
-    })
+    };
+
+    if reflow && let Some(blocks) = page_blocks {
+        let delta_h = (ed.measured_h - ed.rect.height()) as f64;
+        let scale = ((ed.rect.width() / (ed.source_rect[2] - ed.source_rect[0]).abs().max(0.01)).max(0.01)) as f64;
+        let delta_user_h = delta_h / scale;
+        if delta_user_h.abs() > 2.0 {
+            let threshold_y = ed.source_rect[1] as f64 + 4.0;
+            let mut targets = Vec::new();
+            for (idx, b) in blocks.iter().enumerate() {
+                if idx != ed.block && b.rect[3] <= threshold_y {
+                    targets.push(pdfcraft_engine::ObjectTarget {
+                        kind: pdfcraft_engine::ObjectKind::Text,
+                        index: idx,
+                    });
+                }
+            }
+            if !targets.is_empty() {
+                return Some(Edit::Batch {
+                    label: "Edit text and reflow paragraphs".into(),
+                    edits: vec![
+                        edit,
+                        Edit::MoveObjects {
+                            page: ed.page,
+                            objects: targets,
+                            offset: [0.0, -delta_user_h],
+                        },
+                    ],
+                });
+            }
+        }
+    }
+
+    Some(edit)
 }
 
 /// Caret colour that stays visible on a field filled with `fill`: black on light fills, white on dark ones.
@@ -1819,6 +1871,7 @@ mod tests {
             family_chosen: false,
             extras: Extras::default(),
             extras0: Extras::default(),
+            measured_h: 0.0,
         };
         (app, ed)
     }
@@ -1926,5 +1979,58 @@ mod tests {
         assert_eq!(caret_color_on(Color32::from_rgb(0xFF, 0xFF, 0xF4)), Color32::BLACK);
         assert_eq!(caret_color_on(Color32::BLACK), Color32::WHITE);
         assert_eq!(caret_color_on(DARK_EDITOR_FILL), Color32::WHITE);
+    }
+
+    #[test]
+    fn test_finished_edit_with_and_without_reflow() {
+        let (_app, mut ed) = preview_app();
+        ed.text = "Expanded line 1\nLine 2\nLine 3".into();
+        ed.rect = Rect::from_min_max(Pos2::new(50.0, 100.0), Pos2::new(250.0, 150.0));
+        ed.source_rect = [50.0, 100.0, 250.0, 150.0];
+        ed.measured_h = 90.0;
+
+        let other_block_above = pdfcraft_engine::TextBlock {
+            text: "Above".into(),
+            rect: [50.0, 160.0, 250.0, 200.0],
+            base_font: "Helvetica".into(),
+            size: 12.0,
+            bold: false,
+            italic: false,
+            color: [0.0, 0.0, 0.0],
+            rotation: 0.0,
+            lines: vec![],
+            rows: vec![],
+            editor_text: "Above".into(),
+            spans: vec![],
+            invisible: false,
+        };
+        let other_block_below = pdfcraft_engine::TextBlock {
+            text: "Below".into(),
+            rect: [50.0, 20.0, 250.0, 80.0],
+            base_font: "Helvetica".into(),
+            size: 12.0,
+            bold: false,
+            italic: false,
+            color: [0.0, 0.0, 0.0],
+            rotation: 0.0,
+            lines: vec![],
+            rows: vec![],
+            editor_text: "Below".into(),
+            spans: vec![],
+            invisible: false,
+        };
+        let page_blocks = vec![other_block_above, other_block_below];
+
+        // 1. When reflow is OFF: returns single Edit::EditTextBlock
+        let no_reflow_edit = finished_edit(ed.clone(), false, Some(&page_blocks));
+        assert!(matches!(no_reflow_edit, Some(Edit::EditTextBlock { .. })));
+
+        // 2. When reflow is ON: returns Edit::Batch with Edit::EditTextBlock and Edit::MoveObjects for block below
+        let reflow_edit = finished_edit(ed, true, Some(&page_blocks));
+        assert!(matches!(reflow_edit, Some(Edit::Batch { ref edits, .. }) if edits.len() == 2));
+        if let Some(Edit::Batch { edits, .. }) = reflow_edit {
+            assert!(matches!(edits[0], Edit::EditTextBlock { .. }));
+            assert!(matches!(&edits[1], Edit::MoveObjects { objects, .. } if objects.len() == 1 && objects[0].index == 1));
+        }
     }
 }

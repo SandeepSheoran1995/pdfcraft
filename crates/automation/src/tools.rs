@@ -596,7 +596,6 @@ pub fn tools() -> Vec<ToolDef> {
             "Generate and add a QR code to a page",
             "Generate a QR code encoding text or URL and place it as content on a page: in rect (points from the top-left of the page), or centred at its natural size. Undoable; movable with content_update.",
         )
-        .cmd("edit.qr")
         .with(schema(
             json!({ "doc": doc(), "page": { "type": "integer", "minimum": 1 }, "text": { "type": "string", "minLength": 1 }, "rect": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 } }),
             &["doc", "page", "text"],

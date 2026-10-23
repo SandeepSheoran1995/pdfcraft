@@ -529,7 +529,7 @@ impl ZoomNavigationEngine {
 }
 
 /// Actions triggered by the floating selection context menu.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FloatingMenuAction {
     /// Cut the element content to clipboard and remove it from the document.
     Cut,
@@ -553,6 +553,18 @@ pub enum FloatingMenuAction {
     ToggleStrikethrough,
     /// Open the symbol insertion palette.
     OpenSymbolPalette,
+    /// Change stroke color for selected line or shape: `[r, g, b]` (0.0..=1.0)
+    SetStrokeColor([f64; 3]),
+    /// Change stroke width in points
+    SetStrokeWidth(f64),
+    /// Change dash pattern index: 0 = solid, 1 = dotted, 2 = dashed, 3 = dash-dot
+    SetDash(usize),
+    /// Toggle connected perpendicular lines mode (Excel grid)
+    ToggleGridMode,
+    /// Duplicate the selected element (PowerPoint-style Ctrl+D)
+    Duplicate,
+    /// Toggle word-like paragraph reflow mode
+    ToggleReflow,
 }
 
 /// Floating context menu and quick action toolbar anchored to canvas selections.
@@ -592,11 +604,115 @@ impl FloatingContextMenu {
         }
 
         let sel = view.canvas_selection.selected.as_ref()?;
-        if sel.kind == SelectableKind::VectorLine {
-            return None;
-        }
         let xf = view.page_xform(sel.page)?;
         let screen_rect = sel.screen_rect(&xf, info);
+
+        if sel.kind == SelectableKind::VectorLine {
+            let menu_width = 330.0;
+            let menu_height = 36.0;
+            let anchor = Self::compute_anchor(screen_rect, viewport, menu_width, menu_height)?;
+            let t = crate::theme::Tokens::get(ui.ctx());
+            let mut action = None;
+
+            egui::Area::new(egui::Id::new(("floating-line-menu", view.id.0, sel.page, sel.index)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(anchor)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::NONE
+                        .fill(t.card)
+                        .stroke(Stroke::new(1.0, t.border))
+                        .corner_radius(CornerRadius::same(8))
+                        .shadow(egui::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(if t.dark() { 90 } else { 32 }) })
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.horizontal(|ui| {
+                                // 1. Color Swatch & Quick Palette
+                                let cur_color = view.line_properties.color;
+                                let color_32 = Color32::from_rgb((cur_color[0] * 255.0) as u8, (cur_color[1] * 255.0) as u8, (cur_color[2] * 255.0) as u8);
+                                let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::click());
+                                ui.painter().rect_filled(rect, 4.0, color_32);
+                                ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                                egui::Popup::menu(&resp).show(|ui| {
+                                    ui.label("Line Color:");
+                                    let palette = [
+                                        ([0.0, 0.0, 0.0], "Black"),
+                                        ([0.85, 0.15, 0.15], "Red"),
+                                        ([0.08, 0.45, 0.90], "Blue"),
+                                        ([0.10, 0.65, 0.25], "Green"),
+                                        ([0.95, 0.55, 0.10], "Orange"),
+                                        ([0.50, 0.50, 0.50], "Gray"),
+                                    ];
+                                    ui.horizontal(|ui| {
+                                        for (rgb, name) in palette {
+                                            let col = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
+                                            let (cr, cresp) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::click());
+                                            ui.painter().rect_filled(cr, 3.0, col);
+                                            ui.painter().rect_stroke(cr, CornerRadius::same(3), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                                            if cresp.on_hover_text(name).clicked() {
+                                                action = Some(FloatingMenuAction::SetStrokeColor(rgb));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
+
+                                ui.separator();
+
+                                // 2. Stroke Width (Thickness)
+                                let cur_w = view.line_properties.width;
+                                if crate::icons::button(ui, "minus", 20.0, false, "Thinner").clicked() {
+                                    action = Some(FloatingMenuAction::SetStrokeWidth((cur_w - 0.5).max(0.5)));
+                                }
+                                ui.label(format!("{:.1}pt", cur_w));
+                                if crate::icons::button(ui, "plus", 20.0, false, "Thicker").clicked() {
+                                    action = Some(FloatingMenuAction::SetStrokeWidth((cur_w + 0.5).min(20.0)));
+                                }
+
+                                ui.separator();
+
+                                // 3. Dash Type (Solid, Dotted, Dashed)
+                                let dash_names = ["Solid ──", "Dotted ··", "Dashed --", "DashDot -·-"];
+                                let cur_dash = dash_names.get(view.line_properties.dash_idx).copied().unwrap_or(dash_names[0]);
+                                egui::ComboBox::from_id_salt("floating_line_dash")
+                                    .selected_text(cur_dash)
+                                    .width(72.0)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, name) in dash_names.iter().enumerate() {
+                                            if ui.selectable_label(view.line_properties.dash_idx == idx, *name).clicked() {
+                                                action = Some(FloatingMenuAction::SetDash(idx));
+                                            }
+                                        }
+                                    });
+
+                                ui.separator();
+
+                                // 4. Excel Grid Toggle
+                                let extend = view.extend_perpendicular_lines;
+                                let grid_tip = if extend {
+                                    "Connected Grid Mode: ON (drag extends perpendicular lines)"
+                                } else {
+                                    "Connected Grid Mode: OFF (click to extend perpendicular lines)"
+                                };
+                                if crate::icons::button(ui, "grid-3x3", 24.0, extend, grid_tip).clicked() {
+                                    action = Some(FloatingMenuAction::ToggleGridMode);
+                                }
+
+                                // 5. Duplicate (Ctrl+D)
+                                if crate::icons::button(ui, "copy-plus", 24.0, false, "Duplicate (Ctrl+D)").clicked() {
+                                    action = Some(FloatingMenuAction::Duplicate);
+                                }
+
+                                // 6. Delete
+                                if crate::icons::button(ui, "trash-2", 24.0, false, tl!("Delete")).clicked() {
+                                    action = Some(FloatingMenuAction::Delete);
+                                }
+                            });
+                        });
+                });
+
+            return action;
+        }
 
         let is_text = matches!(sel.kind, SelectableKind::TextLine | SelectableKind::TextBlock);
         let is_image = matches!(sel.kind, SelectableKind::Image);
@@ -627,9 +743,9 @@ impl FloatingContextMenu {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let shortcut = |key: &'static str| crate::commands::shortcut_label(ui.ctx(), pdfcraft_engine::commands::Shortcut::cmd(key));
-                        let cut_tip = crate::i18n::fmt(tl!("Cut ({key})"), &[("key", &shortcut("X"))]);
-                        let copy_tip = crate::i18n::fmt(tl!("Copy ({key})"), &[("key", &shortcut("C"))]);
-                        let paste_tip = crate::i18n::fmt(tl!("Paste ({key})"), &[("key", &shortcut("V"))]);
+                        let cut_tip = format!("Cut ({})", shortcut("X"));
+                        let copy_tip = format!("Copy ({})", shortcut("C"));
+                        let paste_tip = format!("Paste ({})", shortcut("V"));
                         ui.horizontal(|ui| {
                             // Cut (Ctrl+X)
                             if can_modify && can_copy && sel.text.is_some() && crate::icons::button(ui, "scissors", 26.0, false, &cut_tip).clicked() {
@@ -647,12 +763,13 @@ impl FloatingContextMenu {
                             // Format Painter (for text elements)
                             if is_text && can_modify {
                                 let has_format = view.canvas_selection.format_painter.is_some();
+                                let format_tip = if has_format { "Apply formatting (Format Painter)" } else { "Pick up formatting (Format Painter)" };
                                 if crate::icons::button(
                                     ui,
                                     "brush",
                                     26.0,
                                     has_format,
-                                    if has_format { tl!("Apply formatting (Format Painter)") } else { tl!("Pick up formatting (Format Painter)") },
+                                    format_tip,
                                 )
                                 .clicked()
                                 {
@@ -677,22 +794,39 @@ impl FloatingContextMenu {
                                 if crate::icons::button(ui, "strikethrough", 26.0, false, tl!("Strikethrough")).clicked() {
                                     action = Some(FloatingMenuAction::ToggleStrikethrough);
                                 }
-                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, tl!("Insert symbol"))
+                                if crate::icons::button(ui, "sparkles", 26.0, view.canvas_selection.symbol_palette_open, "Insert symbol")
                                     .clicked()
                                 {
                                     action = Some(FloatingMenuAction::OpenSymbolPalette);
                                 }
+                                let reflow_on = view.reflow_paragraphs;
+                                let reflow_tip = if reflow_on {
+                                    "Paragraph Reflow: ON (editing shifts paragraphs below) - click to toggle"
+                                } else {
+                                    "Paragraph Reflow: OFF (bottom paragraphs stay fixed) - click to toggle"
+                                };
+                                if crate::icons::button(ui, "arrow-up-down", 26.0, reflow_on, reflow_tip).clicked() {
+                                    action = Some(FloatingMenuAction::ToggleReflow);
+                                }
                             }
 
-                            // Recognize Text (OCR for images)
-                            if is_image && can_modify && crate::icons::button(ui, "scan-text", 26.0, false, tl!("Recognize text (OCR)")).clicked() {
-                                action = Some(FloatingMenuAction::RecognizeOcr);
+                            // Recognize Text & Duplicate for images
+                            if is_image && can_modify {
+                                let w = (sel.user_rect[2] - sel.user_rect[0]).abs();
+                                let h = (sel.user_rect[3] - sel.user_rect[1]).abs();
+                                ui.label(format!("{:.0}×{:.0}pt", w, h));
+                                if crate::icons::button(ui, "copy-plus", 26.0, false, "Duplicate (Ctrl+D)").clicked() {
+                                    action = Some(FloatingMenuAction::Duplicate);
+                                }
+                                if crate::icons::button(ui, "scan-text", 26.0, false, "Recognize text (OCR)").clicked() {
+                                    action = Some(FloatingMenuAction::RecognizeOcr);
+                                }
                             }
 
                             // Separator before Delete
                             if can_modify {
                                 ui.separator();
-                                if crate::icons::button(ui, "trash-2", 26.0, false, tl!("Delete (Del)")).clicked() {
+                                if crate::icons::button(ui, "trash-2", 26.0, false, "Delete (Del)").clicked() {
                                     action = Some(FloatingMenuAction::Delete);
                                 }
                             }
@@ -1105,5 +1239,21 @@ mod tests {
         let right_up = updates.iter().find(|u| u.index == 2).expect("row_right update must exist");
         assert_eq!(right_up.new_start, [125.0, 80.0], "row_right should shift its start to x=125");
         assert_eq!(right_up.new_end, [180.0, 80.0]);
+    }
+
+    #[test]
+    fn test_selectable_element_vector_line_and_bbox() {
+        let seg = LineSegment {
+            page: 1,
+            index: 4,
+            start: [10.0, 50.0],
+            end: [110.0, 50.0],
+            thickness: 2.0,
+        };
+        let el = SelectableElement::new_line_vector(1, seg);
+        assert_eq!(el.page, 1);
+        assert_eq!(el.kind, SelectableKind::VectorLine);
+        assert_eq!(el.index, 4);
+        assert_eq!(el.user_rect, [10.0, 50.0, 110.0, 50.0]);
     }
 }

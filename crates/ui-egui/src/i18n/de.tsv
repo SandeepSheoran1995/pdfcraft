@@ -2517,13 +2517,3 @@ animation effects	Off	Aus
 	field names can't contain a period: {name}	Feldnamen dürfen keinen Punkt enthalten: {name}
 	two cells would both be named {name}	zwei Zellen hätten beide den Namen {name}
 	a field named {name} already exists	ein Feld namens {name} ist bereits vorhanden
-# Vector line properties panel
-Line Properties	Linien-Eigenschaften
-Color:	Farbe:
-Width:	Breite:
-Solid	Durchgehend
-Dotted	Gepunktet
-Dashed	Gestrichelt
-Dash	Strich
-Apply	Übernehmen
-Toggle vector line editing mode	Vektorlinien-Bearbeitungsmodus umschalten

@@ -275,16 +275,15 @@ impl ViewDefaults {
     /// for anything else, including a percentage outside the 8–6400% the view can show.
     pub fn with_zoom(self, name: &str) -> Option<Self> {
         let name = name.trim();
-        let (fit, continuous, zoom) = if name.eq_ignore_ascii_case("fit-width") {
-            (Fit::Width, true, self.zoom)
+        let (fit, zoom) = if name.eq_ignore_ascii_case("fit-width") {
+            (Fit::Width, self.zoom)
         } else if name.eq_ignore_ascii_case("fit-page") {
-            (Fit::Page, false, self.zoom)
+            (Fit::Page, self.zoom)
         } else {
             let percent = name.strip_suffix('%').unwrap_or(name).trim().parse::<f32>().ok().filter(|p| (8.0..=6400.0).contains(p))?;
-            let z = percent / 100.0;
-            (Fit::None, if z >= 1.25 { true } else { self.continuous }, z)
+            (Fit::None, percent / 100.0)
         };
-        Some(Self { fit, continuous, zoom, ..self })
+        Some(Self { fit, zoom, ..self })
     }
 }
 
@@ -456,6 +455,17 @@ pub struct LinePropertiesState {
 impl Default for LinePropertiesState {
     fn default() -> Self {
         Self { color: [0.0, 0.0, 0.0], width: 1.0, dash_idx: 0, last_error: None }
+    }
+}
+
+impl LinePropertiesState {
+    pub fn dash_pattern(&self) -> Vec<f64> {
+        match self.dash_idx {
+            1 => vec![2.0, 2.0],
+            2 => vec![6.0, 3.0],
+            3 => vec![6.0, 2.0, 2.0, 2.0],
+            _ => vec![],
+        }
     }
 }
 
@@ -667,6 +677,8 @@ pub struct DocView {
     pub line_properties: LinePropertiesState,
     /// Active vector line endpoint/move drag: `(handle, current_user_coord, start_user_coord)`.
     pub line_drag: Option<(crate::canvas_selection::SelectionHandle, [f64; 2], [f64; 2])>,
+    /// Whether editing a paragraph reflows paragraphs below it.
+    pub reflow_paragraphs: bool,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
@@ -958,6 +970,7 @@ impl DocView {
             extend_perpendicular_lines: false,
             line_properties: Default::default(),
             line_drag: None,
+            reflow_paragraphs: false,
             barcode_hud: Default::default(),
             barcode_scan: None,
             fill_signature_page: None,
@@ -1594,11 +1607,6 @@ impl DocView {
     /// Switch the zoom mode, keeping the current page in view.
     pub fn set_fit(&mut self, fit: Fit) {
         self.fit = fit;
-        match fit {
-            Fit::Page => self.continuous = false,
-            Fit::Width => self.continuous = true,
-            _ => {}
-        }
         self.goto = Some((self.current, 0.0));
         self.reset_coarse_state();
     }
@@ -2562,6 +2570,34 @@ impl PageXform {
     }
 }
 
+/// Placement grid guide overlay: painted over the page while dragging objects to assist alignment.
+pub fn paint_placement_grid_guide(painter: &egui::Painter, xf: &PageXform) {
+    let r = xf.rect;
+    let step = (20.0 * xf.zoom()).max(10.0);
+    let minor_stroke = Stroke::new(0.5, Color32::from_black_alpha(25));
+    let major_stroke = Stroke::new(1.0, Color32::from_black_alpha(45));
+
+    // Vertical grid lines
+    let mut x = r.min.x;
+    let mut count_x = 0;
+    while x <= r.max.x + 0.5 {
+        let is_major = count_x % 5 == 0;
+        painter.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], if is_major { major_stroke } else { minor_stroke });
+        x += step;
+        count_x += 1;
+    }
+
+    // Horizontal grid lines
+    let mut y = r.min.y;
+    let mut count_y = 0;
+    while y <= r.max.y + 0.5 {
+        let is_major = count_y % 5 == 0;
+        painter.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], if is_major { major_stroke } else { minor_stroke });
+        y += step;
+        count_y += 1;
+    }
+}
+
 pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_speed::ScrollSpeed) {
     use egui::{Key, KeyboardShortcut, Modifiers};
     if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F))) {
@@ -2666,6 +2702,120 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
         view.pending_text_open = Some((sel.page, key));
         view.canvas_selection.clear();
     }
+    // Arrow keys nudge selected element (lines, shapes, images, text)
+    let mut did_nudge = false;
+    if arrows
+        && view.line_editor.is_none()
+        && view.comments.composer.is_none()
+    {
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let step = if shift { 10.0 } else { 1.0 };
+        let mut dx = 0.0_f64;
+        let mut dy = 0.0_f64;
+        if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
+            dx -= step;
+        }
+        if ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+            dx += step;
+        }
+        if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+            dy += step;
+        }
+        if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+            dy -= step;
+        }
+        if dx != 0.0 || dy != 0.0 {
+            if let Some(sel) = view.canvas_selection.selected.as_mut() {
+                match sel.kind {
+                    crate::canvas_selection::SelectableKind::VectorLine => {
+                        let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index };
+                        view.pending_edit = Some(Edit::MoveObjects { page: sel.page, objects: vec![target], offset: [dx, dy] });
+                        sel.user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
+                        if let Some(line) = sel.line.as_mut() {
+                            line.start = [line.start[0] + dx, line.start[1] + dy];
+                            line.end = [line.end[0] + dx, line.end[1] + dy];
+                        }
+                        did_nudge = true;
+                    }
+                    crate::canvas_selection::SelectableKind::Image => {
+                        let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::Image, index: sel.index };
+                        view.pending_edit = Some(Edit::MoveObjects { page: sel.page, objects: vec![target], offset: [dx, dy] });
+                        sel.user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
+                        did_nudge = true;
+                    }
+                    crate::canvas_selection::SelectableKind::TextBlock => {
+                        let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::Text, index: sel.index };
+                        view.pending_edit = Some(Edit::MoveObjects { page: sel.page, objects: vec![target], offset: [dx, dy] });
+                        sel.user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
+                        did_nudge = true;
+                    }
+                    _ => {}
+                }
+            } else if let Some((page, index)) = view.comments.selected {
+                view.pending_edit = Some(Edit::MoveAnnotation { page, index, dx, dy });
+                did_nudge = true;
+            }
+        }
+    }
+
+    // Duplicate shortcut (Ctrl+D / Cmd+D)
+    if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(Key::D))
+        && view.line_editor.is_none()
+        && let Some(sel) = &view.canvas_selection.selected
+    {
+        let offset = 15.0;
+        match sel.kind {
+            crate::canvas_selection::SelectableKind::VectorLine => {
+                if let Some(line) = &sel.line {
+                    let new_start = [line.start[0] + offset, line.start[1] - offset];
+                    let new_end = [line.end[0] + offset, line.end[1] - offset];
+                    let style = pdfcraft_engine::Style {
+                        color: [
+                            view.line_properties.color[0] as f64,
+                            view.line_properties.color[1] as f64,
+                            view.line_properties.color[2] as f64,
+                        ],
+                        opacity: 1.0,
+                        width: view.line_properties.width,
+                        fill: None,
+                    };
+                    view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                        page: sel.page,
+                        shape: pdfcraft_engine::Shape::Line {
+                            from: new_start,
+                            to: new_end,
+                            start: pdfcraft_engine::LineEnding::None,
+                            end: pdfcraft_engine::LineEnding::None,
+                        },
+                        style,
+                        contents: String::new(),
+                        author: "User".into(),
+                    }));
+                }
+            }
+            crate::canvas_selection::SelectableKind::TextBlock => {
+                let text = sel.text.clone().unwrap_or_default();
+                let r = sel.user_rect;
+                let style = pdfcraft_engine::Style {
+                    color: [0.0, 0.0, 0.0],
+                    opacity: 1.0,
+                    width: 0.0,
+                    fill: None,
+                };
+                view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                    page: sel.page,
+                    shape: pdfcraft_engine::Shape::TextBox {
+                        rect: [r[0] + offset, r[1] - offset, r[2] + offset, r[3] - offset],
+                        font_size: 12.0,
+                    },
+                    style,
+                    contents: text,
+                    author: "User".into(),
+                }));
+            }
+            _ => {}
+        }
+    }
     if key(Key::Home) {
         view.go_to_page(0);
     }
@@ -2686,13 +2836,15 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
     // ⌘Page Down / ⌘Page Up, or plain Page Down / Page Up in single-page view.
     let command = ctx.input(|i| i.modifiers.command);
     let now = ctx.input(|i| i.time);
-    let key_pressed_fresh = |k| ctx.input(|i| i.key_pressed(k));
-    let key_nav =
-        |k| ctx.input(|i| i.key_pressed(k) || i.events.iter().any(|e| matches!(e, egui::Event::Key { key: pk, pressed: true, .. } if *pk == k)));
+    let key_pressed_fresh = |k| (arrows || !matches!(k, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown)) && ctx.input(|i| i.key_pressed(k));
+    let key_nav = |k| {
+        (arrows || !matches!(k, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown))
+            && ctx.input(|i| i.key_pressed(k) || i.events.iter().any(|e| matches!(e, egui::Event::Key { key: pk, pressed: true, .. } if *pk == k)))
+    };
     // The open barcode HUD steps through the page's codes with ← / →; it must not also turn
     // the page and rescan, which would replace the list it is stepping through.
     let hud_arrows = view.barcode_hud.open && view.barcode_hud.panel_open && view.barcode_hud.scanned_codes.len() > 1;
-    if view.line_editor.is_none() {
+    if view.line_editor.is_none() && !did_nudge {
         let mut did_step = false;
         if !hud_arrows && (key_nav(Key::ArrowRight) || (command && key_nav(Key::PageDown))) {
             let is_fresh = key_pressed_fresh(Key::ArrowRight) || (command && key_pressed_fresh(Key::PageDown));
@@ -3187,16 +3339,16 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 } else {
                     (frac * max_scroll).clamp(0.0, max_scroll)
                 }
-            } else if page == 0 && frac <= 0.0 {
-                0.0
+            } else if page == 0 {
+                (frac * r.height()).clamp(0.0, max_scroll)
             } else {
                 (r.top() - y_shift - view.page_gap() + frac * r.height()).clamp(0.0, max_scroll)
             };
             let snapped_y = target_y.round();
-            if !view.continuous || !texture_ready {
+            if (!view.continuous || !texture_ready) && view.goto_point.is_none() {
                 view.single_page_target_y = Some(snapped_y);
             }
-            scroll = scroll.scroll_offset(vec2(0.0, snapped_y));
+            scroll = scroll.vertical_scroll_offset(snapped_y);
             // Horizontally too, as Acrobat does (#2665): beside a much wider page the others sit off
             // to one side. A page already shown whole, or one filling the window's width, keeps the
             // scroll, so paging through a zoomed-in document stays on the same column. Otherwise a
@@ -3212,9 +3364,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             }
         }
     } else if !view.continuous
+        && !middle_gesture
         && let Some(target_y) = view.single_page_target_y
     {
-        scroll = scroll.scroll_offset(vec2(0.0, target_y.round()));
+        scroll = scroll.vertical_scroll_offset(target_y.round());
         if !texture_ready {
             ui.ctx().request_repaint();
         }
@@ -3330,6 +3483,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     // A destination's position (bookmarks, links) refines `goto`: its point at the window's
     // top-left, or the centre of a /FitR rectangle at the window's centre.
     if let Some((page, fx, fy, rel)) = view.goto_point.take() {
+        view.single_page_target_y = None;
         let r = rects[page.min(rects.len() - 1)];
         // Within the content, so an unreachable point never shows a frame scrolled past the end.
         let (max_x, max_y) = ((content_w - avail.width()).max(0.0), (content_h - avail.height()).max(0.0));
@@ -3360,7 +3514,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         // until after the text widgets when a selection owns that drag.
         let wheel_delta = if selection_wheel { Vec2::ZERO } else { precise_scroll + boost_extra };
         let delta = auto_delta + edge_delta - vec2(0.0, key_scroll) + wheel_delta + glide;
-        if delta != Vec2::ZERO && delta.is_finite() && texture_ready {
+        if delta != Vec2::ZERO && delta.is_finite() {
+            view.single_page_target_y = None;
             ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
         }
         let (resp_rect, resp) = ui.allocate_exact_size(vec2(content_w, content_h), Sense::click_and_drag());
@@ -3441,10 +3596,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 PageBackground::Light => Color32::from_rgb(0xF5, 0xF2, 0xEB),
                 PageBackground::Default => paper,
             };
-            let has_tex = view.pages.contains_key(&i) || view.thumbs.contains_key(&i);
-            if has_tex {
-                painter.rect_filled(r, CornerRadius::ZERO, paper_color);
-            }
+            painter.rect_filled(r, CornerRadius::ZERO, paper_color);
             if let Some(err) = view.errors.get(&i) {
                 painter.rect_filled(r, CornerRadius::ZERO, Color32::from_rgb(0xFB, 0xF4, 0xF4));
                 icons::paint(
@@ -3797,9 +3949,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 view.links.context = Some((i, l.index));
             }
             let consumed = (on_objects || on_edit_text || on_link || on_content || boxing || on_field || comments::page_input(ui, &resp, &pcx, view)) && view.line_drag.is_none();
+            let interact_bounds = if view.vector_edit_mode { xf.rect.expand(250.0) } else { xf.rect };
             if tool == QuickTool::Select
                 && (!consumed || view.line_drag.is_some())
-                && let Some(p) = pointer.filter(|p| xf.rect.contains(*p) || view.line_drag.is_some())
+                && let Some(p) = pointer.filter(|p| interact_bounds.contains(*p) || view.line_drag.is_some())
             {
                 let shift = ui.input(|inp| inp.modifiers.shift);
                 if view.vector_edit_mode {
@@ -3978,34 +4131,36 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                             view.canvas_selection.hovered = None;
                         }
                     }
-                } else if resp.double_clicked() {
-                    if let Some((_idx, block)) =
-                        lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
-                    {
-                        view.pending_text_open = Some((i, pdfcraft_engine::BlockKey::of(block)));
-                        view.canvas_selection.clear();
-                    }
-                } else if resp.clicked() || resp.secondary_clicked() {
-                    if let Some((idx, block)) =
-                        lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
-                    {
-                        let el = crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone());
-                        view.canvas_selection.select_element(el, shift);
-                    } else if !shift && view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == i) {
-                        let near_selection =
-                            view.canvas_selection.selected.as_ref().is_some_and(|s| s.screen_rect(&xf, info).expand(8.0).contains(p));
-                        if !near_selection {
+                } else if tool == QuickTool::EditText {
+                    if resp.double_clicked() {
+                        if let Some((_idx, block)) =
+                            lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
+                        {
+                            view.pending_text_open = Some((i, pdfcraft_engine::BlockKey::of(block)));
                             view.canvas_selection.clear();
                         }
-                    }
-                } else if !view.canvas_selection.has_selection() {
-                    if let Some((idx, block)) =
-                        lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
-                    {
-                        view.canvas_selection.hovered =
-                            Some(crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone()));
-                    } else if view.canvas_selection.hovered.as_ref().is_some_and(|h| h.page == i) {
-                        view.canvas_selection.hovered = None;
+                    } else if resp.clicked() || resp.secondary_clicked() {
+                        if let Some((idx, block)) =
+                            lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
+                        {
+                            let el = crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone());
+                            view.canvas_selection.select_element(el, shift);
+                        } else if !shift && view.canvas_selection.selected.as_ref().is_some_and(|s| s.page == i) {
+                            let near_selection =
+                                view.canvas_selection.selected.as_ref().is_some_and(|s| s.screen_rect(&xf, info).expand(8.0).contains(p));
+                            if !near_selection {
+                                view.canvas_selection.clear();
+                            }
+                        }
+                    } else if !view.canvas_selection.has_selection() {
+                        if let Some((idx, block)) =
+                            lines.iter().enumerate().rev().find(|(_, b)| xf.user_rect(info, i, b.rect.map(|v| v as f32)).expand(3.0).contains(p))
+                        {
+                            view.canvas_selection.hovered =
+                                Some(crate::canvas_selection::SelectableElement::new_block(i, idx, block.rect, block.editor_text.clone()));
+                        } else if view.canvas_selection.hovered.as_ref().is_some_and(|h| h.page == i) {
+                            view.canvas_selection.hovered = None;
+                        }
                     }
                 }
             }
@@ -4101,6 +4256,37 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 {
                     crate::canvas_selection::paint_line_highlight(painter, line, crate::canvas_selection::LineHighlightState::Hover, &xf, info);
                 }
+            }
+
+            // Margin line visibility: when vector edit mode is active, render lines extending outside the page bounds
+            if view.vector_edit_mode
+                && let Some((_, lines)) = view.vector_lines.get(&i)
+            {
+                let sel_idx = view.canvas_selection.selected.as_ref().filter(|s| s.page == i && s.kind == crate::canvas_selection::SelectableKind::VectorLine).map(|s| s.index);
+                for line in lines {
+                    if Some(line.index) == sel_idx {
+                        continue;
+                    }
+                    let s = crate::canvas_selection::project_user_point(&xf, info, i, line.start);
+                    let e = crate::canvas_selection::project_user_point(&xf, info, i, line.end);
+                    if !xf.rect.contains(s) || !xf.rect.contains(e) {
+                        let width = (line.thickness as f32).clamp(1.0, 6.0);
+                        let stroke_color = Color32::from_rgb(
+                            (view.line_properties.color[0] * 255.0) as u8,
+                            (view.line_properties.color[1] * 255.0) as u8,
+                            (view.line_properties.color[2] * 255.0) as u8,
+                        );
+                        painter.line_segment([s, e], Stroke::new(width, stroke_color));
+                    }
+                }
+            }
+
+            // Placement grid guide overlay: shown while dragging objects
+            if view.line_drag.is_some()
+                || view.comments.gesture.is_some()
+                || (resp.dragged() && (view.canvas_selection.has_selection() || view.comments.selected.is_some()))
+            {
+                paint_placement_grid_guide(painter, &xf);
             }
 
             // Text layer: find matches, selection, I-beam and drag-to-select.
@@ -4959,7 +5145,367 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     view.canvas_selection.clear();
                 }
             }
+            crate::canvas_selection::FloatingMenuAction::SetStrokeColor(rgb) => {
+                view.line_properties.color = [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32];
+                if let Some(sel) = &view.canvas_selection.selected
+                    && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                {
+                    view.pending_edit = Some(Edit::SetLineProperties {
+                        page: sel.page,
+                        target: pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index },
+                        color: Some(rgb),
+                        width: None,
+                        dash: None,
+                    });
+                }
+            }
+            crate::canvas_selection::FloatingMenuAction::SetStrokeWidth(w) => {
+                view.line_properties.width = w;
+                if let Some(sel) = &view.canvas_selection.selected
+                    && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                {
+                    view.pending_edit = Some(Edit::SetLineProperties {
+                        page: sel.page,
+                        target: pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index },
+                        color: None,
+                        width: Some(w),
+                        dash: None,
+                    });
+                }
+            }
+            crate::canvas_selection::FloatingMenuAction::SetDash(idx) => {
+                view.line_properties.dash_idx = idx;
+                if let Some(sel) = &view.canvas_selection.selected
+                    && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                {
+                    view.pending_edit = Some(Edit::SetLineProperties {
+                        page: sel.page,
+                        target: pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index },
+                        color: None,
+                        width: None,
+                        dash: Some(view.line_properties.dash_pattern()),
+                    });
+                }
+            }
+            crate::canvas_selection::FloatingMenuAction::ToggleGridMode => {
+                view.extend_perpendicular_lines = !view.extend_perpendicular_lines;
+            }
+            crate::canvas_selection::FloatingMenuAction::ToggleReflow => {
+                view.reflow_paragraphs = !view.reflow_paragraphs;
+            }
+            crate::canvas_selection::FloatingMenuAction::Duplicate => {
+                if let Some(sel) = &view.canvas_selection.selected {
+                    let offset = 15.0;
+                    match sel.kind {
+                        crate::canvas_selection::SelectableKind::VectorLine => {
+                            if let Some(line) = &sel.line {
+                                let new_start = [line.start[0] + offset, line.start[1] - offset];
+                                let new_end = [line.end[0] + offset, line.end[1] - offset];
+                                let style = pdfcraft_engine::Style {
+                                    color: [
+                                        view.line_properties.color[0] as f64,
+                                        view.line_properties.color[1] as f64,
+                                        view.line_properties.color[2] as f64,
+                                    ],
+                                    opacity: 1.0,
+                                    width: view.line_properties.width,
+                                    fill: None,
+                                };
+                                view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                                    page: sel.page,
+                                    shape: pdfcraft_engine::Shape::Line {
+                                        from: new_start,
+                                        to: new_end,
+                                        start: pdfcraft_engine::LineEnding::None,
+                                        end: pdfcraft_engine::LineEnding::None,
+                                    },
+                                    style,
+                                    contents: String::new(),
+                                    author: "User".into(),
+                                }));
+                            }
+                        }
+                        crate::canvas_selection::SelectableKind::TextBlock => {
+                            let text = sel.text.clone().unwrap_or_default();
+                            let r = sel.user_rect;
+                            let style = pdfcraft_engine::Style {
+                                color: [0.0, 0.0, 0.0],
+                                opacity: 1.0,
+                                width: 0.0,
+                                fill: None,
+                            };
+                            view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                                page: sel.page,
+                                shape: pdfcraft_engine::Shape::TextBox {
+                                    rect: [r[0] + offset, r[1] - offset, r[2] + offset, r[3] - offset],
+                                    font_size: 12.0,
+                                },
+                                style,
+                                contents: text,
+                                author: "User".into(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
+    }
+
+    // Floating Shape Formatting Toolbar (PowerPoint 365 style)
+    if app.quick_tool == QuickTool::Select
+        && view.canvas_selection.selected.is_none()
+        && view.line_editor.is_none()
+        && can_modify
+        && let Some((sel_page, sel_idx)) = view.comments.selected
+        && let Some(annot) = doc.info.annotations.iter().find(|a| a.page == sel_page && a.index == sel_idx && a.in_reply_to.is_none())
+        && matches!(annot.subtype.as_str(), "Square" | "Circle" | "Line" | "Polygon" | "PolyLine")
+        && let Some(xf) = view.page_xform(sel_page)
+    {
+        let screen_rect = xf.user_rect(info, sel_page, annot.rect);
+        let menu_width = 380.0;
+        let menu_height = 36.0;
+        let anchor_x = (screen_rect.center().x - menu_width / 2.0).clamp(avail.left() + 8.0, (avail.right() - menu_width - 8.0).max(avail.left() + 8.0));
+        let anchor_y = if screen_rect.top() - menu_height - 10.0 >= avail.top() + 6.0 {
+            screen_rect.top() - menu_height - 10.0
+        } else {
+            (screen_rect.bottom() + 10.0).min(avail.bottom() - menu_height - 6.0)
+        };
+
+        let t = theme::Tokens::get(ui.ctx());
+        let props = doc.comment_props(sel_page, sel_idx);
+
+        egui::Area::new(egui::Id::new(("floating-shape-toolbar", view.id.0, sel_page, sel_idx)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(anchor_x, anchor_y))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(t.card)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 14,
+                        spread: 0,
+                        color: Color32::from_black_alpha(if t.dark() { 90 } else { 32 }),
+                    })
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.horizontal(|ui| {
+                            // 1. Shape Fill (for fillable shapes)
+                            let is_fillable = matches!(annot.subtype.as_str(), "Square" | "Circle" | "Polygon");
+                            if is_fillable {
+                                let cur_fill = props.as_ref().and_then(|p| p.fill);
+                                let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                                if let Some(rgb) = cur_fill {
+                                    let col = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
+                                    ui.painter().rect_filled(rect, 4.0, col);
+                                } else {
+                                    ui.painter().rect_filled(rect, 4.0, Color32::WHITE);
+                                    ui.painter().line_segment([rect.left_bottom(), rect.right_top()], Stroke::new(1.5, Color32::RED));
+                                }
+                                ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                                egui::Popup::menu(&resp.on_hover_text("Shape Fill")).show(|ui| {
+                                    ui.label("Shape Fill:");
+                                    if ui.button("No Fill").clicked() {
+                                        view.pending_edit = Some(Edit::FillAnnotation { page: sel_page, index: sel_idx, fill: None });
+                                        ui.close();
+                                    }
+                                    let palette = [
+                                        ([1.0, 1.0, 1.0], "White"),
+                                        ([0.0, 0.0, 0.0], "Black"),
+                                        ([0.85, 0.15, 0.15], "Red"),
+                                        ([0.08, 0.45, 0.90], "Blue"),
+                                        ([0.10, 0.65, 0.25], "Green"),
+                                        ([0.98, 0.82, 0.10], "Yellow"),
+                                        ([0.95, 0.55, 0.10], "Orange"),
+                                        ([0.50, 0.50, 0.50], "Gray"),
+                                    ];
+                                    ui.horizontal(|ui| {
+                                        for (rgb, name) in palette {
+                                            let col = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
+                                            let (cr, cresp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                            ui.painter().rect_filled(cr, 3.0, col);
+                                            ui.painter().rect_stroke(cr, CornerRadius::same(3), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                                            if cresp.on_hover_text(name).clicked() {
+                                                view.pending_edit = Some(Edit::FillAnnotation { page: sel_page, index: sel_idx, fill: Some(rgb) });
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                            }
+
+                            // 2. Shape Outline
+                            let cur_stroke = props.as_ref().and_then(|p| p.color).unwrap_or([0.0, 0.0, 0.0]);
+                            let stroke_col = Color32::from_rgb((cur_stroke[0] * 255.0) as u8, (cur_stroke[1] * 255.0) as u8, (cur_stroke[2] * 255.0) as u8);
+                            let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                            ui.painter().rect_filled(rect, 4.0, stroke_col);
+                            ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                            egui::Popup::menu(&resp.on_hover_text("Shape Outline Color")).show(|ui| {
+                                ui.label("Outline Color:");
+                                let palette = [
+                                    ([0.0, 0.0, 0.0], "Black"),
+                                    ([1.0, 1.0, 1.0], "White"),
+                                    ([0.85, 0.15, 0.15], "Red"),
+                                    ([0.08, 0.45, 0.90], "Blue"),
+                                    ([0.10, 0.65, 0.25], "Green"),
+                                    ([0.98, 0.82, 0.10], "Yellow"),
+                                    ([0.95, 0.55, 0.10], "Orange"),
+                                    ([0.50, 0.50, 0.50], "Gray"),
+                                ];
+                                ui.horizontal(|ui| {
+                                    for (rgb, name) in palette {
+                                        let col = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
+                                        let (cr, cresp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                        ui.painter().rect_filled(cr, 3.0, col);
+                                        ui.painter().rect_stroke(cr, CornerRadius::same(3), Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                                        if cresp.on_hover_text(name).clicked() {
+                                            view.pending_edit = Some(Edit::StyleAnnotation {
+                                                page: sel_page,
+                                                index: sel_idx,
+                                                color: Some(rgb),
+                                                opacity: None,
+                                                width: None,
+                                                endings: None,
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            });
+
+                            let cur_w = props.as_ref().and_then(|p| p.width).unwrap_or(1.0);
+                            if icons::button(ui, "minus", 20.0, false, "Thinner outline").clicked() {
+                                let w = (cur_w - 0.5).max(0.5);
+                                view.pending_edit = Some(Edit::StyleAnnotation {
+                                    page: sel_page,
+                                    index: sel_idx,
+                                    color: None,
+                                    opacity: None,
+                                    width: Some(w),
+                                    endings: None,
+                                });
+                            }
+                            ui.label(format!("{:.1}pt", cur_w));
+                            if icons::button(ui, "plus", 20.0, false, "Thicker outline").clicked() {
+                                let w = (cur_w + 0.5).min(20.0);
+                                view.pending_edit = Some(Edit::StyleAnnotation {
+                                    page: sel_page,
+                                    index: sel_idx,
+                                    color: None,
+                                    opacity: None,
+                                    width: Some(w),
+                                    endings: None,
+                                });
+                            }
+
+                            ui.separator();
+
+                            // 3. Dimensions editing boxes (W × H)
+                            let mut w_val = (annot.rect[2] - annot.rect[0]).abs().round() as f64;
+                            let mut h_val = (annot.rect[3] - annot.rect[1]).abs().round() as f64;
+                            ui.label("W:");
+                            let w_resp = ui.add(egui::DragValue::new(&mut w_val).range(2.0..=2000.0).speed(1.0).suffix("pt"));
+                            ui.label("H:");
+                            let h_resp = ui.add(egui::DragValue::new(&mut h_val).range(2.0..=2000.0).speed(1.0).suffix("pt"));
+                            if (w_resp.changed() || h_resp.changed()) && !w_resp.dragged() && !h_resp.dragged() {
+                                let min_x = annot.rect[0] as f64;
+                                let max_y = annot.rect[3] as f64;
+                                let new_rect = [min_x, max_y - h_val, min_x + w_val, max_y];
+                                view.pending_edit = Some(Edit::ResizeAnnotation { page: sel_page, index: sel_idx, rect: new_rect });
+                            }
+
+                            ui.separator();
+
+                            // 4. Duplicate (Ctrl+D)
+                            if icons::button(ui, "copy-plus", 22.0, false, "Duplicate shape (Ctrl+D)").clicked() {
+                                let style = pdfcraft_engine::Style {
+                                    color: props.as_ref().and_then(|p| p.color).unwrap_or([0.0, 0.0, 0.0]),
+                                    opacity: props.as_ref().map(|p| p.opacity).unwrap_or(1.0),
+                                    width: props.as_ref().and_then(|p| p.width).unwrap_or(1.0),
+                                    fill: props.as_ref().and_then(|p| p.fill),
+                                };
+                                let shape = match annot.subtype.as_str() {
+                                    "Square" => pdfcraft_engine::Shape::Rectangle {
+                                        rect: [
+                                            annot.rect[0] as f64 + 15.0,
+                                            annot.rect[1] as f64 - 15.0,
+                                            annot.rect[2] as f64 + 15.0,
+                                            annot.rect[3] as f64 - 15.0,
+                                        ],
+                                    },
+                                    "Circle" => pdfcraft_engine::Shape::Oval {
+                                        rect: [
+                                            annot.rect[0] as f64 + 15.0,
+                                            annot.rect[1] as f64 - 15.0,
+                                            annot.rect[2] as f64 + 15.0,
+                                            annot.rect[3] as f64 - 15.0,
+                                        ],
+                                    },
+                                    "Line" => {
+                                        let (p0, p1) = if annot.points.len() >= 2 {
+                                            (
+                                                [annot.points[0][0] as f64 + 15.0, annot.points[0][1] as f64 - 15.0],
+                                                [annot.points[1][0] as f64 + 15.0, annot.points[1][1] as f64 - 15.0],
+                                            )
+                                        } else {
+                                            (
+                                                [annot.rect[0] as f64 + 15.0, annot.rect[1] as f64 - 15.0],
+                                                [annot.rect[2] as f64 + 15.0, annot.rect[3] as f64 - 15.0],
+                                            )
+                                        };
+                                        let (s, e) = props
+                                            .as_ref()
+                                            .and_then(|p| p.endings.clone())
+                                            .and_then(|e| if e.len() >= 2 { Some((e[0], e[1])) } else { None })
+                                            .unwrap_or((pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::None));
+                                        pdfcraft_engine::Shape::Line { from: p0, to: p1, start: s, end: e }
+                                    }
+                                    "Polygon" => pdfcraft_engine::Shape::Polygon {
+                                        vertices: annot.points.iter().map(|p| [p[0] as f64 + 15.0, p[1] as f64 - 15.0]).collect(),
+                                        cloud: annot.intent.as_deref() == Some("PolygonCloud"),
+                                    },
+                                    "PolyLine" => {
+                                        let (s, e) = props
+                                            .as_ref()
+                                            .and_then(|p| p.endings.clone())
+                                            .and_then(|e| if e.len() >= 2 { Some((e[0], e[1])) } else { None })
+                                            .unwrap_or((pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::None));
+                                        pdfcraft_engine::Shape::PolyLine {
+                                            vertices: annot.points.iter().map(|p| [p[0] as f64 + 15.0, p[1] as f64 - 15.0]).collect(),
+                                            start: s,
+                                            end: e,
+                                        }
+                                    },
+                                    _ => pdfcraft_engine::Shape::Rectangle {
+                                        rect: [
+                                            annot.rect[0] as f64 + 15.0,
+                                            annot.rect[1] as f64 - 15.0,
+                                            annot.rect[2] as f64 + 15.0,
+                                            annot.rect[3] as f64 - 15.0,
+                                        ],
+                                    },
+                                };
+                                view.pending_edit = Some(Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                                    page: sel_page,
+                                    shape,
+                                    style,
+                                    contents: annot.contents.clone().unwrap_or_default(),
+                                    author: annot.author.clone().unwrap_or_else(|| "User".into()),
+                                }));
+                            }
+
+                            // 5. Delete
+                            if icons::button(ui, "trash-2", 22.0, false, "Delete (Del)").clicked() {
+                                view.pending_edit = Some(Edit::DeleteAnnotation { page: sel_page, index: sel_idx });
+                                view.comments.selected = None;
+                            }
+                        });
+                    });
+            });
     }
 
     // Barcode & QR Code Scanner HUD (Unified Single HUD)
@@ -5883,7 +6429,7 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                     // Vector Line Edit tool button
                     if let Some((tab_idx, _)) = app.active_ids() {
                         let vector_active = app.views.get(tab_idx).is_some_and(|v| v.vector_edit_mode);
-                        if icons::button(ui, "spline", 32.0, vector_active, tl!("Vector Line Edit")).clicked()
+                        if icons::button(ui, "spline", 32.0, vector_active, "Vector Line Edit").clicked()
                             && let Some(v) = app.views.get_mut(tab_idx)
                         {
                             v.vector_edit_mode = !v.vector_edit_mode;
@@ -5891,24 +6437,76 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                                 app.quick_tool = QuickTool::Select;
                             }
                         }
-                        if vector_active {
-                            let extend = app.views.get(tab_idx).is_some_and(|v| v.extend_perpendicular_lines);
-                            let tooltip = if extend {
-                                tl!("Connected lines: On (Excel grid mode) - click for Individual drag")
-                            } else {
-                                tl!("Connected lines: Off (Individual drag) - click for Excel grid mode")
-                            };
-                            if icons::button(ui, "grid-3x3", 32.0, extend, tooltip).clicked()
-                                && let Some(v) = app.views.get_mut(tab_idx)
-                            {
-                                v.extend_perpendicular_lines = !v.extend_perpendicular_lines;
+                        let extend = app.views.get(tab_idx).is_some_and(|v| v.extend_perpendicular_lines);
+                        let tooltip = if extend {
+                            "Connected lines: On (Excel grid mode) - click for Individual drag"
+                        } else {
+                            "Connected lines: Off (Individual drag) - click for Excel grid mode"
+                        };
+                        if icons::button(ui, "grid-3x3", 32.0, extend, tooltip).clicked()
+                            && let Some(v) = app.views.get_mut(tab_idx)
+                        {
+                            v.extend_perpendicular_lines = !v.extend_perpendicular_lines;
+                            if v.extend_perpendicular_lines {
+                                v.vector_edit_mode = true;
+                                app.quick_tool = QuickTool::Select;
                             }
                         }
                     }
+                    // Shapes (PowerPoint 365 style shapes insertion flyout)
+                    let shapes_active = matches!(
+                        app.quick_tool,
+                        QuickTool::Comment(
+                            comments::CommentTool::Rectangle
+                                | comments::CommentTool::Oval
+                                | comments::CommentTool::Line
+                                | comments::CommentTool::Arrow
+                                | comments::CommentTool::Polygon
+                                | comments::CommentTool::PolyLine
+                        )
+                    );
+                    let shape_resp = icons::button(ui, "square", 32.0, shapes_active, "Shapes (Insert Shape)");
+                    let sr = shape_resp.rect;
+                    let tri = [sr.right_bottom() + vec2(-4.0, -4.0), sr.right_bottom() + vec2(-9.0, -4.0), sr.right_bottom() + vec2(-4.0, -9.0)];
+                    ui.painter().add(egui::Shape::convex_polygon(tri.to_vec(), if shapes_active { t.accent } else { t.text_faint }, Stroke::NONE));
+                    let open_shapes = (shape_resp.clicked() && shapes_active) || shape_resp.secondary_clicked();
+                    if shape_resp.clicked() && !shapes_active {
+                        app.execute(comments::CommentTool::Rectangle.command());
+                    }
+                    egui::Popup::menu(&shape_resp)
+                        .open_memory(open_shapes.then_some(egui::SetOpenCommand::Toggle))
+                        .align(egui::RectAlign::RIGHT_START)
+                        .gap(6.0)
+                        .show(|ui| {
+                            let shape_tools = [
+                                (comments::CommentTool::Rectangle, "square", "Rectangle"),
+                                (comments::CommentTool::Oval, "circle", "Circle / Oval"),
+                                (comments::CommentTool::Line, "minus", "Line"),
+                                (comments::CommentTool::Arrow, "arrow-right", "Arrow"),
+                                (comments::CommentTool::Polygon, "pentagon", "Polygon"),
+                                (comments::CommentTool::PolyLine, "spline", "Connected Lines (PolyLine)"),
+                            ];
+                            for (tool, icon, label) in shape_tools {
+                                let on = app.quick_tool == QuickTool::Comment(tool);
+                                let (row, click) = ui.allocate_exact_size(vec2(180.0, 28.0), Sense::click());
+                                let press = theme::Press::track(ui, &click);
+                                press.wash(ui, row, 4, on);
+                                let body = row.translate(press.offset());
+                                icons::paint(ui, Rect::from_min_size(body.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon, 16.0, t.text);
+                                crate::widgets::paint_left(ui, body.left_center() + vec2(34.0, 0.0), label, theme::regular(13.0), t.text, 130.0);
+                                if on {
+                                    icons::paint(ui, Rect::from_min_size(body.right_top() + vec2(-24.0, 7.0), vec2(14.0, 14.0)), "check", 14.0, t.accent);
+                                }
+                                if click.clicked() {
+                                    app.execute(tool.command());
+                                    ui.close();
+                                }
+                            }
+                        });
                     // QR & Barcode Tools (Scanner & Generator)
                     if let Some((tab_idx, _)) = app.active_ids() {
                         let is_open = app.views.get(tab_idx).is_some_and(|v| v.barcode_hud.open);
-                        if icons::button(ui, "scan", 32.0, is_open, tl!("QR & Barcode Tools")).clicked()
+                        if icons::button(ui, "scan", 32.0, is_open, "QR & Barcode Tools").clicked()
                             && let Some(v) = app.views.get_mut(tab_idx)
                         {
                             v.barcode_hud.open = !v.barcode_hud.open;
@@ -5920,7 +6518,7 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                     }
                     // Barcode select tool: click a code on the page to open its HUD.
                     let qr_tool = app.quick_tool == QuickTool::QrBarcode;
-                    if icons::button(ui, "scan-text", 32.0, qr_tool, tl!("Select barcodes")).clicked() {
+                    if icons::button(ui, "scan-text", 32.0, qr_tool, "Select barcodes").clicked() {
                         app.quick_tool = if qr_tool { QuickTool::Select } else { QuickTool::QrBarcode };
                         if !qr_tool
                             && let Some((tab_idx, _)) = app.active_ids()

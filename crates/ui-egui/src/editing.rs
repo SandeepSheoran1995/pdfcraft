@@ -1165,24 +1165,24 @@ pub fn line_properties_panel(
     };
 
     ui.group(|ui| {
-        ui.heading(tl!("Line Properties"));
+        ui.heading("Line Properties");
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label(tl!("Color:"));
+            ui.label("Color:");
             egui::color_picker::color_edit_button_rgb(ui, &mut view.line_properties.color);
         });
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label(tl!("Width:"));
+            ui.label("Width:");
             ui.add(egui::Slider::new(&mut view.line_properties.width, 0.5..=20.0).step_by(0.5).suffix(" pt"));
         });
         ui.add_space(4.0);
 
-        let dash_labels = [tl!("Solid"), tl!("Dotted"), tl!("Dashed")];
+        let dash_labels = ["Solid", "Dotted", "Dashed"];
         let current_dash = dash_labels.get(view.line_properties.dash_idx).copied().unwrap_or(dash_labels[0]);
-        egui::ComboBox::from_label(tl!("Dash"))
+        egui::ComboBox::from_label("Dash")
             .selected_text(current_dash)
             .show_ui(ui, |ui| {
                 for (idx, label) in dash_labels.iter().enumerate() {
@@ -1190,7 +1190,7 @@ pub fn line_properties_panel(
                 }
             });
         ui.add_space(4.0);
-        ui.add(crate::widgets::checkbox(&mut view.extend_perpendicular_lines, tl!("Extend touching lines (Excel grid)")));
+        ui.add(crate::widgets::checkbox(&mut view.extend_perpendicular_lines, "Extend touching lines (Excel grid)"));
         ui.add_space(6.0);
 
         if ui.button(tl!("Apply")).clicked() {
