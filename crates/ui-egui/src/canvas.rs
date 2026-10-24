@@ -2832,19 +2832,86 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
             if let Some(sel) = view.canvas_selection.selected.as_mut() {
                 match sel.kind {
                     crate::canvas_selection::SelectableKind::VectorLine => {
-                        let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index };
-                        view.pending_edit = Some(Edit::MoveObjects { page: sel.page, objects: vec![target], offset: [dx, dy] });
-                        sel.user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
                         if let Some(line) = sel.line.as_mut() {
-                            line.start = [line.start[0] + dx, line.start[1] + dy];
-                            line.end = [line.end[0] + dx, line.end[1] + dy];
+                            let is_horizontal = (line.start[1] - line.end[1]).abs() < 1.0;
+                            let is_vertical = (line.start[0] - line.end[0]).abs() < 1.0;
+                            // Horizontal lines (e.g. row borders) move UP/DOWN only; vertical lines move LEFT/RIGHT only.
+                            if is_horizontal {
+                                dx = 0.0;
+                            } else if is_vertical {
+                                dy = 0.0;
+                            }
+                            if dx != 0.0 || dy != 0.0 {
+                                let orig_start = line.start;
+                                let orig_end = line.end;
+                                let new_start = [line.start[0] + dx, line.start[1] + dy];
+                                let new_end = [line.end[0] + dx, line.end[1] + dy];
+                                line.start = new_start;
+                                line.end = new_end;
+                                sel.user_rect = [
+                                    new_start[0].min(new_end[0]),
+                                    new_start[1].min(new_end[1]),
+                                    new_start[0].max(new_end[0]),
+                                    new_start[1].max(new_end[1]),
+                                ];
+                                if let Some((_, lines)) = view.vector_lines.get_mut(&sel.page)
+                                    && let Some(l) = lines.iter_mut().find(|l| l.index == line.index)
+                                {
+                                    l.start = new_start;
+                                    l.end = new_end;
+                                }
+                                let target = pdfcraft_engine::ObjectTarget {
+                                    kind: pdfcraft_engine::ObjectKind::VectorLine,
+                                    index: line.index,
+                                };
+                                let mut edits = vec![Edit::UpdateLineEndpoints {
+                                    page: sel.page,
+                                    target,
+                                    new_start,
+                                    new_end,
+                                }];
+                                if view.extend_perpendicular_lines
+                                    && let Some((_, lines)) = view.vector_lines.get(&sel.page)
+                                {
+                                    let updates = crate::canvas_selection::compute_connected_perpendicular_line_updates(
+                                        lines,
+                                        line.index,
+                                        orig_start,
+                                        orig_end,
+                                        new_start,
+                                        new_end,
+                                    );
+                                    if let Some((_, cached_lines)) = view.vector_lines.get_mut(&sel.page) {
+                                        for up in updates {
+                                            if let Some(cl) = cached_lines.iter_mut().find(|l| l.index == up.index) {
+                                                cl.start = up.new_start;
+                                                cl.end = up.new_end;
+                                            }
+                                            edits.push(Edit::UpdateLineEndpoints {
+                                                page: sel.page,
+                                                target: up.target,
+                                                new_start: up.new_start,
+                                                new_end: up.new_end,
+                                            });
+                                        }
+                                    }
+                                }
+                                if edits.len() == 1 {
+                                    view.pending_edit = edits.pop();
+                                } else {
+                                    view.pending_edit = Some(Edit::Batch {
+                                        label: "Adjust grid lines".to_string(),
+                                        edits,
+                                    });
+                                }
+                                did_nudge = true;
+                            }
                         }
-                        did_nudge = true;
                     }
                     crate::canvas_selection::SelectableKind::Image => {
-                        let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::Image, index: sel.index };
-                        view.pending_edit = Some(Edit::MoveObjects { page: sel.page, objects: vec![target], offset: [dx, dy] });
-                        sel.user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
+                        let new_user_rect = [sel.user_rect[0] + dx, sel.user_rect[1] + dy, sel.user_rect[2] + dx, sel.user_rect[3] + dy];
+                        sel.user_rect = new_user_rect;
+                        view.pending_edit = Some(Edit::EditPageImage { page: sel.page, index: sel.index, change: pdfcraft_engine::ImageEdit::Move(new_user_rect) });
                         did_nudge = true;
                     }
                     crate::canvas_selection::SelectableKind::TextBlock => {
@@ -4103,7 +4170,52 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     if let Some((handle, _, start_p)) = view.line_drag {
                         ui.ctx().set_cursor_icon(handle.cursor_icon());
                         if resp.dragged() {
-                            let user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
+                            let mut user_p = crate::canvas_selection::screen_to_user_point(&xf, info, i, p);
+                            let shift = ui.input(|inp| inp.modifiers.shift);
+                            if let Some(sel) = view.canvas_selection.selected.as_ref()
+                                && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+                                && let Some(line) = sel.line.as_ref()
+                            {
+                                let is_horizontal = (line.start[1] - line.end[1]).abs() < 1.0;
+                                let is_vertical = (line.start[0] - line.end[0]).abs() < 1.0;
+                                match handle {
+                                    crate::canvas_selection::SelectionHandle::Move => {
+                                        let mut dx = user_p[0] - start_p[0];
+                                        let mut dy = user_p[1] - start_p[1];
+                                        if is_horizontal {
+                                            dx = 0.0;
+                                        } else if is_vertical {
+                                            dy = 0.0;
+                                        } else if shift {
+                                            if dx.abs() > dy.abs() { dy = 0.0; } else { dx = 0.0; }
+                                        }
+                                        user_p = [start_p[0] + dx, start_p[1] + dy];
+                                    }
+                                    crate::canvas_selection::SelectionHandle::LineStart => {
+                                        if is_horizontal {
+                                            user_p[1] = line.start[1];
+                                        } else if is_vertical {
+                                            user_p[0] = line.start[0];
+                                        } else if shift {
+                                            let dx = (user_p[0] - line.end[0]).abs();
+                                            let dy = (user_p[1] - line.end[1]).abs();
+                                            if dx > dy { user_p[1] = line.end[1]; } else { user_p[0] = line.end[0]; }
+                                        }
+                                    }
+                                    crate::canvas_selection::SelectionHandle::LineEnd => {
+                                        if is_horizontal {
+                                            user_p[1] = line.end[1];
+                                        } else if is_vertical {
+                                            user_p[0] = line.end[0];
+                                        } else if shift {
+                                            let dx = (user_p[0] - line.start[0]).abs();
+                                            let dy = (user_p[1] - line.start[1]).abs();
+                                            if dx > dy { user_p[1] = line.start[1]; } else { user_p[0] = line.start[0]; }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             view.line_drag = Some((handle, user_p, start_p));
                             ui.ctx().request_repaint();
                         }
@@ -4114,12 +4226,27 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                                 && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
                                 && let Some(line) = sel.line.as_mut()
                             {
+                                let is_horizontal = (line.start[1] - line.end[1]).abs() < 1.0;
+                                let is_vertical = (line.start[0] - line.end[0]).abs() < 1.0;
                                 let (new_start, new_end) = match handle {
-                                    crate::canvas_selection::SelectionHandle::LineStart => (final_user_p, line.end),
-                                    crate::canvas_selection::SelectionHandle::LineEnd => (line.start, final_user_p),
+                                    crate::canvas_selection::SelectionHandle::LineStart => {
+                                        let mut pt = final_user_p;
+                                        if is_horizontal { pt[1] = line.start[1]; } else if is_vertical { pt[0] = line.start[0]; }
+                                        (pt, line.end)
+                                    }
+                                    crate::canvas_selection::SelectionHandle::LineEnd => {
+                                        let mut pt = final_user_p;
+                                        if is_horizontal { pt[1] = line.end[1]; } else if is_vertical { pt[0] = line.end[0]; }
+                                        (line.start, pt)
+                                    }
                                     crate::canvas_selection::SelectionHandle::Move => {
-                                        let dx = final_user_p[0] - start_user_p[0];
-                                        let dy = final_user_p[1] - start_user_p[1];
+                                        let mut dx = final_user_p[0] - start_user_p[0];
+                                        let mut dy = final_user_p[1] - start_user_p[1];
+                                        if is_horizontal {
+                                            dx = 0.0;
+                                        } else if is_vertical {
+                                            dy = 0.0;
+                                        }
                                         ([line.start[0] + dx, line.start[1] + dy], [line.end[0] + dx, line.end[1] + dy])
                                     }
                                     _ => (line.start, line.end),
@@ -6664,6 +6791,23 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                         {
                             v.barcode_hud.last_scanned_page = None;
                         }
+                    }
+                    // Reading Eye-Strain Background Tint
+                    let bg_mode = app.reading_bg.mode;
+                    let bg_active = bg_mode != PageBackground::Default;
+                    let bg_tip = format!("Eye strain background: {} (click to cycle, right-click for tint settings)", bg_mode.label());
+                    let bg_resp = icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip);
+                    if bg_resp.clicked() {
+                        app.reading_bg.mode = app.reading_bg.mode.next();
+                        app.reading_bg.color = match app.reading_bg.mode {
+                            PageBackground::Light => Color32::from_rgb(0xF5, 0xF2, 0xEB),
+                            PageBackground::Dark => Color32::from_rgb(0x1E, 0x1E, 0x1E),
+                            PageBackground::Default => app.reading_bg.color,
+                        };
+                        ui.ctx().request_repaint();
+                    }
+                    if bg_resp.secondary_clicked() {
+                        app.reading_bg.picker_open = !app.reading_bg.picker_open;
                     }
                     // Fill & Sign ▸ (text, marks, date, signature).
                     let current_fill = match app.quick_tool {

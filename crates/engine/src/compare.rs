@@ -217,23 +217,58 @@ impl crate::Document {
                 let unit = if crop_width > 0.0 && crop_width.is_finite() && display_width.is_finite() { display_width / crop_width } else { 1.0 };
                 let reading = pdfcraft_edit::reading_blocks_checked(cos, i).unwrap_or_default();
                 let forms_unread = reading.truncated;
-                let blocks = reading
-                    .blocks
-                    .into_iter()
-                    .filter(|b| !b.text.trim().is_empty())
-                    .map(|b| {
-                        let f = b.base_font.to_ascii_lowercase();
-                        pdfcraft_export::Block {
+                let mut blocks = Vec::new();
+                for b in reading.blocks {
+                    if b.text.trim().is_empty() {
+                        continue;
+                    }
+                    let f = b.base_font.to_ascii_lowercase();
+                    let bold = f.contains("bold") || f.contains("black") || f.contains("heavy") || b.bold;
+                    let italic = f.contains("italic") || f.contains("oblique") || b.italic;
+                    let rotation = b.rotation - f64::from(info.rotation);
+
+                    if b.rows.len() > 1 {
+                        for row_indices in &b.rows {
+                            let mut row_rect: Option<[f64; 4]> = None;
+                            let mut row_text = String::new();
+                            for &idx in row_indices {
+                                if let Some(line) = reading.lines.get(idx) {
+                                    row_rect = Some(match row_rect {
+                                        Some(r) => [r[0].min(line.rect[0]), r[1].min(line.rect[1]), r[2].max(line.rect[2]), r[3].max(line.rect[3])],
+                                        None => line.rect,
+                                    });
+                                    if !row_text.is_empty() && !row_text.ends_with(' ') && !line.text.starts_with(' ') {
+                                        row_text.push(' ');
+                                    }
+                                    row_text.push_str(&line.text);
+                                }
+                            }
+                            let text = row_text.trim().to_string();
+                            if !text.is_empty() {
+                                let rect = row_rect.unwrap_or(b.rect);
+                                blocks.push(pdfcraft_export::Block {
+                                    text,
+                                    rect: visible_rect(rect),
+                                    size: b.size * unit,
+                                    bold,
+                                    italic,
+                                    color: b.color,
+                                    rotation,
+                                });
+                            }
+                        }
+                    } else {
+                        blocks.push(pdfcraft_export::Block {
                             text: b.text,
                             rect: visible_rect(b.rect),
                             size: b.size * unit,
-                            bold: f.contains("bold") || f.contains("black") || f.contains("heavy"),
-                            italic: f.contains("italic") || f.contains("oblique"),
+                            bold,
+                            italic,
                             color: b.color,
-                            rotation: b.rotation - f64::from(info.rotation),
-                        }
-                    })
-                    .collect();
+                            rotation,
+                        });
+                    }
+                }
                 let placed = if images { pdfcraft_edit::reading_images(cos, i).unwrap_or_default() } else { Vec::new() };
                 let mut over_budget = false;
                 let images = placed

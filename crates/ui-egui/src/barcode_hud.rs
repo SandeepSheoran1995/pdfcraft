@@ -601,43 +601,41 @@ impl BarcodeScannerHud {
                                     });
                             }
 
-                            // Section 3: Collapsible "Generate New QR / Barcode" Section
+                            // Section 3: Prominent "Embed QR / Barcode" Section (Always visible)
                             ui.add_space(8.0);
-                            ui.collapsing("Generate New QR / Barcode", |ui| {
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Type:").font(theme::medium(11.0)).color(text_muted));
-                                    egui::ComboBox::from_id_salt("generate-code-type-dropdown")
-                                        .selected_text(state.generate_kind.label())
-                                        .width(180.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::QrCode, "QR Code");
-                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code39, "Code 39 Barcode (139)");
-                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code128, "Code 128 Barcode");
-                                            ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Ean13, "EAN-13 Barcode");
-                                        });
-                                });
-                                ui.add_space(4.0);
-                                let hint = match state.generate_kind {
-                                    pdfcraft_engine::barcode_scan::CodeKind::QrCode => "https://example.com or text...",
-                                    pdfcraft_engine::barcode_scan::CodeKind::Code39 => "ALPHANUMERIC (e.g. CODE39)",
-                                    pdfcraft_engine::barcode_scan::CodeKind::Code128 => "Any ASCII text...",
-                                    pdfcraft_engine::barcode_scan::CodeKind::Ean13 => "12 or 13 digits (e.g. 590123412345)",
-                                    _ => "Enter payload...",
-                                };
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut state.qr_input)
-                                        .desired_width(ui.available_width())
-                                        .desired_rows(2)
-                                        .hint_text(hint),
-                                );
-                                ui.add_space(6.0);
-                                let can_gen = can_modify && !state.qr_input.trim().is_empty();
-                                let btn_label = format!("⚡ Embed {} on Page", state.generate_kind.label());
-                                if ui.add_enabled(can_gen, egui::Button::new(btn_label)).clicked() {
-                                    trigger_generate = true;
-                                }
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Generate & Embed Code on Page").font(theme::semibold(12.0)).color(text_primary));
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::QrCode, "QR Code");
+                                ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code128, "Code 128 Barcode");
+                                ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Code39, "Code 39");
+                                ui.selectable_value(&mut state.generate_kind, pdfcraft_engine::barcode_scan::CodeKind::Ean13, "EAN-13");
                             });
+                            ui.add_space(4.0);
+                            let hint = match state.generate_kind {
+                                pdfcraft_engine::barcode_scan::CodeKind::QrCode => "QR payload (URL, text)...",
+                                pdfcraft_engine::barcode_scan::CodeKind::Code39 => "Code 39 payload (e.g. CODE39)...",
+                                pdfcraft_engine::barcode_scan::CodeKind::Code128 => "Code 128 barcode payload (e.g. 12345678)...",
+                                pdfcraft_engine::barcode_scan::CodeKind::Ean13 => "12 or 13 digits (e.g. 590123412345)...",
+                                _ => "Enter code payload...",
+                            };
+                            ui.add(
+                                egui::TextEdit::multiline(&mut state.qr_input)
+                                    .desired_width(ui.available_width())
+                                    .desired_rows(2)
+                                    .hint_text(hint),
+                            );
+                            ui.add_space(6.0);
+                            let can_gen = can_modify && !state.qr_input.trim().is_empty();
+                            let btn_label = match state.generate_kind {
+                                pdfcraft_engine::barcode_scan::CodeKind::QrCode => "⚡ Embed QR Code on Page".to_string(),
+                                _ => format!("⚡ Embed {} on Page", state.generate_kind.label()),
+                            };
+                            if ui.add_enabled(can_gen, egui::Button::new(btn_label)).clicked() {
+                                trigger_generate = true;
+                            }
 
                             // Feedback Toast
                             if let Some((msg, expiry)) = &state.toast

@@ -693,11 +693,15 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         view.goto = Some((view.current, 0.0));
                     }
                     if ui.available_height() >= 220.0 {
-                        let bg_tip = format!("Page background: {} (click to cycle)", bg_mode.label());
+                        let bg_tip = format!("Page background: {} (click to cycle, right-click for tint settings)", bg_mode.label());
                         let bg_active = bg_mode != PageBackground::Default;
-                        if icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip).clicked() {
+                        let resp = icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip);
+                        if resp.clicked() {
                             cycle_bg = true;
                             ui.ctx().request_repaint();
+                        }
+                        if resp.secondary_clicked() {
+                            toggle_picker = true;
                         }
                         if bg_active {
                             let swatch_tip = "Background color & tint settings";

@@ -974,7 +974,17 @@ pub(crate) fn image_input(
                     let y = if start.y < fixed.y { fixed.y - h } else { fixed.y };
                     Rect::from_min_size(Pos2::new(x, y), egui::vec2(w, h))
                 }
-                None => b.translate(p - start),
+                None => {
+                    let mut delta = p - start;
+                    if ui.input(|i| i.modifiers.shift) {
+                        if delta.x.abs() > delta.y.abs() {
+                            delta.y = 0.0;
+                        } else {
+                            delta.x = 0.0;
+                        }
+                    }
+                    b.translate(delta)
+                }
             };
             // Move/resize the full placement by the visible frame's change. The engine
             // transforms an isolated crop together with its image, preserving its contents.

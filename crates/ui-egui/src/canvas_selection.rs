@@ -351,7 +351,14 @@ impl SelectionLayoutEngine {
                 }
 
                 if resp.dragged() {
-                    let delta = resp.drag_delta();
+                    let mut delta = resp.drag_delta();
+                    if ui.input(|i| i.modifiers.shift) {
+                        if delta.x.abs() > delta.y.abs() {
+                            delta.y = 0.0;
+                        } else {
+                            delta.x = 0.0;
+                        }
+                    }
                     if delta != egui::Vec2::ZERO {
                         handle_dragged = Some((handle, delta));
                     }

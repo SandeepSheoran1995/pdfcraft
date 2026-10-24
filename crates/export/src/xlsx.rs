@@ -104,6 +104,9 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
     let pages = if pages.is_empty() { &dummy[..] } else { pages };
 
     let mut sheets: Vec<String> = Vec::new();
+    let mut sheet_drawings: Vec<Option<(String, String)>> = Vec::new(); // (drawing_xml, drawing_rels)
+    let mut media_files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut global_image_counter = 0usize;
 
     for (page_index, p) in pages.iter().enumerate() {
         let (tables, consumed) = crate::tables(&p.blocks);
@@ -113,7 +116,20 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
 
         let mut current_row = 1usize;
 
-        // Process non-table blocks (e.g. Title, header info)
+        // Candidate column edges across all blocks on the page
+        let mut col_xs: Vec<f64> = p.blocks.iter().map(|b| b.rect[0]).collect();
+        col_xs.sort_by(|a, b| a.total_cmp(b));
+        let mut col_edges: Vec<f64> = Vec::new();
+        for x in col_xs {
+            match col_edges.last_mut() {
+                Some(e) if (x - *e).abs() <= 16.0 => {
+                    *e = (*e + x) * 0.5;
+                }
+                _ => col_edges.push(x),
+            }
+        }
+
+        // Process non-table blocks (e.g. Title, header info, key-value rows)
         let mut header_blocks: Vec<&Block> = p
             .blocks
             .iter()
@@ -123,7 +139,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
             .collect();
         header_blocks.sort_by(|a, b| b.rect[3].total_cmp(&a.rect[3]).then(a.rect[0].total_cmp(&b.rect[0])));
 
-        // Cluster blocks into rows if there are standalone blocks
+        // Cluster blocks into rows based on vertical alignment
         let mut line_groups: Vec<Vec<&Block>> = Vec::new();
         for b in header_blocks {
             if let Some(group) = line_groups.last_mut()
@@ -136,12 +152,16 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
             line_groups.push(vec![b]);
         }
 
-        // Emit header blocks
+        // Emit header / non-table blocks
         for mut group in line_groups {
             group.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
             let mut cells = Vec::new();
-            for (ci, b) in group.iter().enumerate() {
-                let col = ci + 1;
+            let mut last_col = 0usize;
+            for b in group {
+                let natural_col = col_edges.iter().position(|&e| (b.rect[0] - e).abs() <= 16.0).unwrap_or(0) + 1;
+                let col = natural_col.max(last_col + 1);
+                last_col = col;
+
                 let text = b.text.trim().to_string();
                 let num = parse_numeric(&text);
                 let style = if b.size >= 14.0 || b.bold {
@@ -256,6 +276,44 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
             merge_xml.push_str("</mergeCells>");
         }
 
+        // Process embedded images (drawings)
+        let drawing_tag = if !p.images.is_empty() {
+            let mut drw_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">");
+            let mut drw_rels = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+
+            for (local_idx, im) in p.images.iter().enumerate() {
+                global_image_counter += 1;
+                let ext = if im.ext.is_empty() { "png" } else { im.ext };
+                let media_name = format!("image{global_image_counter}.{ext}");
+                media_files.push((media_name.clone(), im.bytes.to_vec()));
+
+                let (w, h) = ((im.rect[2] - im.rect[0]).max(10.0), (im.rect[3] - im.rect[1]).max(10.0));
+                let cx = (w * 12700.0).round() as i64;
+                let cy = (h * 12700.0).round() as i64;
+                let col = (im.rect[0] / 64.0).floor().clamp(0.0, 50.0) as usize;
+                let top_pt = if p.height > 0.0 { (p.height - im.rect[3]).max(0.0) } else { 0.0 };
+                let row = (top_pt / 20.0).floor().clamp(0.0, 500.0) as usize;
+                let col_off = ((im.rect[0] % 64.0) * 12700.0).round() as i64;
+                let row_off = ((top_pt % 20.0) * 12700.0).round() as i64;
+
+                let r_id = local_idx + 1;
+                drw_xml.push_str(&format!(
+                    "<xdr:oneCellAnchor><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>{col_off}</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>{row_off}</xdr:rowOff></xdr:from><xdr:ext cx=\"{cx}\" cy=\"{cy}\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{global_image_counter}\" name=\"Picture {global_image_counter}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rIdImg{r_id}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"
+                ));
+                drw_rels.push_str(&format!(
+                    "<Relationship Id=\"rIdImg{r_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{media_name}\"/>"
+                ));
+            }
+
+            drw_xml.push_str("</xdr:wsDr>");
+            drw_rels.push_str("</Relationships>");
+            sheet_drawings.push(Some((drw_xml, drw_rels)));
+            "<drawing r:id=\"rIdDrw1\"/>"
+        } else {
+            sheet_drawings.push(None);
+            ""
+        };
+
         // Only the first sheet is selected; marking every sheet selected opens Excel in
         // group mode, where an edit applies to every page sheet at once.
         let selected = if page_index == 0 { " tabSelected=\"1\"" } else { "" };
@@ -269,6 +327,7 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
 <sheetData>{sheet_data}</sheetData>\
 {merge_xml}\
 <pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/>\
+{drawing_tag}\
 </worksheet>"
         );
 
@@ -314,6 +373,8 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
 <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Default Extension=\"png\" ContentType=\"image/png\"/>\
+<Default Extension=\"jpg\" ContentType=\"image/jpeg\"/>\
 <Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>\
 <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
 <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
@@ -322,6 +383,11 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
         types.push_str(&format!(
             "<Override PartName=\"/xl/worksheets/sheet{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
         ));
+        if sheet_drawings.get(i - 1).and_then(|d| d.as_ref()).is_some() {
+            types.push_str(&format!(
+                "<Override PartName=\"/xl/drawings/drawing{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/>"
+            ));
+        }
     }
     types.push_str("</Types>");
     z.add("[Content_Types].xml", types.as_bytes(), true);
@@ -376,6 +442,19 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
 
     for (i, sheet_xml) in sheets.iter().enumerate() {
         z.add(&format!("xl/worksheets/sheet{}.xml", i + 1), sheet_xml.as_bytes(), true);
+        if let Some((drw_xml, drw_rels)) = sheet_drawings.get(i).and_then(|d| d.as_ref()) {
+            let sheet_rels = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdDrw1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing{}.xml\"/></Relationships>",
+                i + 1
+            );
+            z.add(&format!("xl/worksheets/_rels/sheet{}.xml.rels", i + 1), sheet_rels.as_bytes(), true);
+            z.add(&format!("xl/drawings/drawing{}.xml", i + 1), drw_xml.as_bytes(), true);
+            z.add(&format!("xl/drawings/_rels/drawing{}.xml.rels", i + 1), drw_rels.as_bytes(), true);
+        }
+    }
+
+    for (name, bytes) in &media_files {
+        z.add(&format!("xl/media/{name}"), bytes, false);
     }
 
     z.finish()
