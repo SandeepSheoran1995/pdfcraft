@@ -1,4 +1,4 @@
-//! Interactive Barcode & QR Code Scanner HUD for Sandeep PDF Studio v3 (L7 UI).
+//! Interactive Barcode & QR Code Scanner HUD (L7 UI).
 //!
 //! Provides automated page detection, unified compact HUD (data of one code at a time),
 //! multi-code navigation (◀ / ▶ and arrow keys), 0.5px blue highlight box, clipboard copy,
@@ -302,7 +302,7 @@ impl BarcodeScannerHud {
     /// Render the unified interactive HUD and canvas highlight overlays.
     ///
     /// Returns a pending replacement `Edit` if the user modified and applied a code.
-    pub fn show(ui: &mut egui::Ui, view: &mut DocView, doc: &Document, info: &DocInfo, can_modify: bool) -> Option<Edit> {
+    pub fn show(ui: &mut egui::Ui, view: &mut DocView, _doc: &Document, info: &DocInfo, can_modify: bool) -> Option<Edit> {
         if !view.barcode_hud.open || !view.barcode_hud.panel_open {
             return None;
         }
@@ -395,7 +395,7 @@ impl BarcodeScannerHud {
                 });
         }
 
-        // Sandeep PDF Studio v3 Modern Dark Aesthetics
+        // Modern Dark Aesthetics
         let card_bg = Color32::from_rgb(0x13, 0x14, 0x1A);
         let border_stroke = Stroke::new(1.0, Color32::from_rgb(0x28, 0x2C, 0x3B));
         let item_card_bg = Color32::from_rgb(0x1B, 0x1D, 0x26);
@@ -653,10 +653,9 @@ impl BarcodeScannerHud {
 
         if trigger_rescan {
             state.target_rect = state.active_code().map(|c| c.rect);
-            let codes = doc.scan_page_codes(current_page);
-            let count = codes.len();
-            state.update_codes(codes);
-            state.show_toast(format!("Rescanned: found {count} code(s)"), now);
+            // The background scan picks this up next frame (see auto_scan_on_page_change).
+            state.last_scanned_page = None;
+            state.show_toast("Rescanning…".into(), now);
         }
         if cancel_edit {
             state.edit_buffer = None;
@@ -674,33 +673,45 @@ impl BarcodeScannerHud {
 
             match Document::generate_replacement_code(kind, &buf, pw, ph) {
                 Ok(png_bytes) => {
-                    // Two-step overlay: first whiteout the old code, then place new code over active.rect
-                    let whiteout_bytes = Document::generate_whiteout(pw, ph).unwrap_or_default();
-                    let edits = if !whiteout_bytes.is_empty() {
-                        vec![
-                            Edit::AddImage {
-                                page: current_page,
-                                rect: Some(edit_whiteout),
-                                name: "Whiteout.png".into(),
-                                bytes: Arc::new(whiteout_bytes),
+                    if let Some(image_idx) = active.image_index {
+                        // Replace the embedded raster image directly so no old payload remains underneath.
+                        pending_edit = Some(Edit::EditPageImage {
+                            page: current_page,
+                            index: image_idx,
+                            change: pdfcraft_engine::ImageEdit::Replace {
+                                name: "UpdatedCode.png".into(),
+                                bytes: Arc::new(png_bytes),
                             },
-                            Edit::AddImage {
+                        });
+                    } else {
+                        // Two-step overlay: first whiteout the old code, then place new code over active.rect
+                        let whiteout_bytes = Document::generate_whiteout(pw, ph).unwrap_or_default();
+                        let edits = if !whiteout_bytes.is_empty() {
+                            vec![
+                                Edit::AddImage {
+                                    page: current_page,
+                                    rect: Some(edit_whiteout),
+                                    name: "Whiteout.png".into(),
+                                    bytes: Arc::new(whiteout_bytes),
+                                },
+                                Edit::AddImage {
+                                    page: current_page,
+                                    rect: Some(edit_image),
+                                    name: "UpdatedCode.png".into(),
+                                    bytes: Arc::new(png_bytes),
+                                },
+                            ]
+                        } else {
+                            vec![Edit::AddImage {
                                 page: current_page,
                                 rect: Some(edit_image),
                                 name: "UpdatedCode.png".into(),
                                 bytes: Arc::new(png_bytes),
-                            },
-                        ]
-                    } else {
-                        vec![Edit::AddImage {
-                            page: current_page,
-                            rect: Some(edit_image),
-                            name: "UpdatedCode.png".into(),
-                            bytes: Arc::new(png_bytes),
-                        }]
-                    };
+                            }]
+                        };
 
-                    pending_edit = Some(Edit::Batch { label: "Replace code".into(), edits });
+                        pending_edit = Some(Edit::Batch { label: "Replace code".into(), edits });
+                    }
                     state.target_rect = Some(new_image_rect);
                     state.last_scanned_page = None;
                     state.edit_buffer = None;
@@ -713,23 +724,36 @@ impl BarcodeScannerHud {
             }
         }
         if let Some(active) = delete_code {
-            let (whiteout_rect, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), None);
-            let edit_whiteout = display_rect(whiteout_rect, Some(info), current_page);
-            match Document::generate_whiteout(pw, ph) {
-                Ok(whiteout_png) => {
-                    pending_edit = Some(Edit::AddImage {
-                        page: current_page,
-                        rect: Some(edit_whiteout),
-                        name: "Whiteout.png".into(),
-                        bytes: Arc::new(whiteout_png),
-                    });
-                    state.target_rect = None;
-                    state.last_scanned_page = None;
-                    state.edit_buffer = None;
-                    state.show_toast("Code deleted with whiteout!".into(), now);
-                }
-                Err(e) => {
-                    state.show_toast(format!("Delete failed: {e}"), now);
+            if let Some(image_idx) = active.image_index {
+                // Perform actual removal of the embedded image object so no data remains.
+                pending_edit = Some(Edit::EditPageImage {
+                    page: current_page,
+                    index: image_idx,
+                    change: pdfcraft_engine::ImageEdit::Delete,
+                });
+                state.target_rect = None;
+                state.last_scanned_page = None;
+                state.edit_buffer = None;
+                state.show_toast("Image code deleted from page!".into(), now);
+            } else {
+                let (whiteout_rect, _, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, active.kind, Some(&active.text), None);
+                let edit_whiteout = display_rect(whiteout_rect, Some(info), current_page);
+                match Document::generate_whiteout(pw, ph) {
+                    Ok(whiteout_png) => {
+                        pending_edit = Some(Edit::AddImage {
+                            page: current_page,
+                            rect: Some(edit_whiteout),
+                            name: "Whiteout.png".into(),
+                            bytes: Arc::new(whiteout_png),
+                        });
+                        state.target_rect = None;
+                        state.last_scanned_page = None;
+                        state.edit_buffer = None;
+                        state.show_toast("Vector code covered with whiteout (original vector data preserved)".into(), now);
+                    }
+                    Err(e) => {
+                        state.show_toast(format!("Delete failed: {e}"), now);
+                    }
                 }
             }
         }

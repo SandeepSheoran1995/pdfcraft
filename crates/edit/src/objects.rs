@@ -866,9 +866,10 @@ fn endpoints_merge(a: [f64; 2], b: [f64; 2]) -> bool {
 fn collinear(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
     let v1 = [b[0] - a[0], b[1] - a[1]];
     let v2 = [c[0] - b[0], c[1] - b[1]];
+    let dot = v1[0] * v2[0] + v1[1] * v2[1];
     let cross = v1[0] * v2[1] - v1[1] * v2[0];
     let mag = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt() * (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
-    mag > f64::EPSILON && (cross / mag).abs() < MERGE_ANGLE_EPS
+    mag > f64::EPSILON && dot > 0.0 && (cross / mag).abs() < MERGE_ANGLE_EPS
 }
 
 #[cfg(test)]
@@ -908,6 +909,13 @@ mod line_tests {
     #[test]
     fn merge_does_not_join_different_widths() {
         let raw = vec![([0.0, 0.0], [5.0, 0.0], 1.0), ([5.0, 0.0], [10.0, 0.0], 2.0)];
+        let merged = merge_collinear(&raw);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_does_not_join_reversed() {
+        let raw = vec![([0.0, 0.0], [5.0, 0.0], 1.0), ([5.0, 0.0], [2.0, 0.0], 1.0)];
         let merged = merge_collinear(&raw);
         assert_eq!(merged.len(), 2);
     }

@@ -888,7 +888,8 @@ pub fn project_user_point(xf: &PageXform, info: &DocInfo, page: usize, p: [f64; 
         let [vx, vy] = page_info.user_to_view(p[0] as f32, p[1] as f32);
         xf.norm_to_screen(vx / xf.pw.max(1e-3), vy / xf.ph.max(1e-3))
     } else {
-        xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32 + 1.0, p[1] as f32 + 1.0]).min
+        let (x, y) = (p[0] as f32, p[1] as f32);
+        xf.user_rect(info, page, [x, y, x, y]).min
     }
 }
 

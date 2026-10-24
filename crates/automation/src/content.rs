@@ -138,7 +138,7 @@ impl Automation {
         }
         let rect = rect_arg(a, "rect")?.map(|r| to_display(r, ph));
         let matrix = pdfcraft_engine::qr::QrCode::encode_text(text).map_err(|e| failed(e.to_string()))?;
-        let png_bytes = matrix.to_png_bytes(8, 2).map_err(|e| failed(e.to_string()))?;
+        let png_bytes = matrix.to_png_bytes(8, 4).map_err(|e| failed(e.to_string()))?;
         let mut out = self.apply(a, Edit::AddImage { page, rect, name: "QRCode.png".into(), bytes: std::sync::Arc::new(png_bytes) })?;
         let doc = self.doc(a)?;
         let mine: Vec<_> = doc.added().iter().filter(|x| x.page == page).collect();

@@ -365,14 +365,7 @@ fn try_decode_code128(runs: &[(bool, usize)], start_run_idx: usize) -> Option<(S
                 }
                 let expected = calc_sum % 103;
                 if expected != checksum {
-                    // Tolerant fallback for slight scanning jitter: accept if symbols >= 3 and
-                    // the checksum error is minor (off by 1-2), avoiding misreads while tolerating
-                    // sampling inaccuracies on real barcodes.
-                    let diff = expected.abs_diff(checksum);
-                    let min_diff = diff.min(103 - diff);
-                    if symbols.len() < 3 || min_diff > 2 {
-                        return None;
-                    }
+                    return None;
                 }
 
                 // Decode symbols to ASCII string based on start code mode

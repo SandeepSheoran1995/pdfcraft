@@ -483,7 +483,7 @@ The repository issues backlog has been thoroughly audited and structured into 6 
 - **Root Causes Diagnosed & Fixed**:
   1. *14-Pixel Single-Page Vertical Jerk*:
      - *Defect*: `goto` navigation offset used `(r.top() - y_shift - GAP + frac * r.height())`. In single-page mode, `r.top() - y_shift` evaluates to `MARGIN` (28.0), resulting in `28.0 - 14.0 = 14.0` offset on Frame 1, which egui's ScrollArea immediately clamped to 0.0 on Frame 2 when the page fit within the viewport, causing a 14-pixel vertical jump back and forth on every page transition.
-     - *Fix*: Locked `target_y` in single-page mode to `0.0` when `frac <= 0.0` and `max_scroll` when `frac >= 1.0`. In continuous mode, clamped to `[0.0, max_scroll]`. Locked horizontal offset to `0.0` with `scroll.scroll_offset(vec2(0.0, target_y))`, completely eliminating both vertical jerk and sideways drift.
+     - *Fix*: Locked `target_y` in single-page mode to `0.0` when `frac <= 0.0` and `max_scroll` when `frac >= 1.0`. In continuous mode, clamped to `[0.0, max_scroll]`. Refined target calculations in the `goto` path, eliminating vertical jerk while retaining appropriate horizontal navigation targets.
   2. *Duplicate PageDown/PageUp Execution*:
      - *Defect*: In single-page mode, `key_nav(Key::PageDown)` was matched by `shortcuts` page-step handler, and then re-matched inside the loop by `ZoomNavigationEngine`, calling `view.step_page` twice in the same frame.
      - *Fix*: Cleaned key dispatch logic so `PageDown`/`PageUp` without `command` are processed solely through `ZoomNavigationEngine`.
@@ -544,7 +544,7 @@ The repository issues backlog has been thoroughly audited and structured into 6 
   - `crates/ui-egui/src/canvas.rs`:
     - Wired `BarcodeScannerHud::show` and `BarcodeScannerHud::show_panel` into `document_area` with clean foreground rendering and edit application.
     - Added "QR & Barcode Tools" toggle button using the `"scan"` icon in `quick_bar`.
-    - Fixed `SelectionAction::Replace` in `selection_actions`: mapped directly to inline text editing (`view.pending_text_open`) by intersecting selection quads with page `TextBlock` inventory, setting `app.quick_tool = QuickTool::EditText`, and requesting immediate repaint. Completely eliminates unwanted red strikethrough/redaction markup comments.
+    - In `selection_actions`: `SelectionAction::Replace` sets `view.comments.replace` and opens the Replace comment composer for the selected text quads.
     - Updated navigation keyboard shortcuts with `key_nav` to handle OS repeat events (`Event::Key { pressed: true, .. }`) for smooth continuous scrolling and fast page flipping based on zoom level.
     - Guarded keyboard page navigation when `view.line_editor.is_some()` so multiline text editing cursor operations remain uninterrupted.
   - `crates/ui-egui/src/barcode_hud.rs`:

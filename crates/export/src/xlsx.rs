@@ -137,7 +137,8 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
         }
 
         // Emit header blocks
-        for group in line_groups {
+        for mut group in line_groups {
+            group.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
             let mut cells = Vec::new();
             for (ci, b) in group.iter().enumerate() {
                 let col = ci + 1;
@@ -145,8 +146,6 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
                 let num = parse_numeric(&text);
                 let style = if b.size >= 14.0 || b.bold {
                     STYLE_TITLE
-                } else if num.is_some() {
-                    STYLE_NUMBER_BORDER
                 } else {
                     STYLE_DEFAULT
                 };
@@ -300,7 +299,7 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
 <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
 <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"><alignment horizontal=\"center\" vertical=\"center\" wrapText=\"1\"/></xf>\
 <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"><alignment vertical=\"center\"/></xf>\
-<xf numFmtId=\"2\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"><alignment horizontal=\"right\" vertical=\"center\"/></xf>\
+<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"><alignment horizontal=\"right\" vertical=\"center\"/></xf>\
 <xf numFmtId=\"0\" fontId=\"2\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"><alignment vertical=\"center\"/></xf>\
 <xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"2\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\"><alignment vertical=\"center\"/></xf>\
 </cellXfs>\
@@ -465,6 +464,7 @@ mod tests {
                 },
             ],
             images: Vec::new(),
+            background: None,
         };
 
         let bytes = xlsx(&[p], "Test Invoice");

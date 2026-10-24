@@ -52,15 +52,15 @@ fn run_drawingml(text: &str, size: f64, bold: bool, italic: bool, color: [f64; 3
 }
 
 /// Generates a DrawingML table inside a `<p:graphicFrame>` with explicit cell borders.
-fn pptx_table(shape_id: usize, t: &Table, x: i64, y: i64, content_w: i64) -> (String, i64) {
+fn pptx_table(shape_id: usize, t: &Table, x: i64, y: i64, content_w: i64, scale: f64) -> (String, i64) {
     let mut edges = t.cols.clone();
     edges.push(t.rect[2]);
     let widths_pt: Vec<f64> = edges.windows(2).map(|w| (w[1] - w[0]).max(20.0)).collect();
     let total_pt: f64 = widths_pt.iter().sum();
-    let scale = if total_pt > 0.0 { (content_w as f64 / (total_pt * 12700.0)).min(1.0) } else { 1.0 };
-    let widths: Vec<i64> = widths_pt.iter().map(|w| (w * scale * 12700.0).round().max(127000.0) as i64).collect();
+    let col_scale = if total_pt > 0.0 { (content_w as f64 / (total_pt * 12700.0)).min(1.0) } else { 1.0 };
+    let widths: Vec<i64> = widths_pt.iter().map(|w| (w * col_scale * 12700.0).round().max(127000.0) as i64).collect();
     let table_w: i64 = widths.iter().fold(0i64, |sum, w| sum.saturating_add(*w));
-    let row_h: i64 = height_emu(24.0);
+    let row_h: i64 = height_emu(24.0 * scale);
     let table_h: i64 = i64::try_from(t.rows.len()).unwrap_or(i64::MAX).saturating_mul(row_h).min(MAX_ITEM_EMU);
 
     let mut grid_cols = String::new();
@@ -80,7 +80,7 @@ fn pptx_table(shape_id: usize, t: &Table, x: i64, y: i64, content_w: i64) -> (St
         rows_xml.push_str(&format!("<a:tr h=\"{row_h}\">"));
         for c in row {
             let span = c.span.max(1);
-            let run = run_drawingml(&c.text, c.size, c.bold, c.italic, c.color);
+            let run = run_drawingml(&c.text, c.size * scale, c.bold, c.italic, c.color);
             if span > 1 {
                 rows_xml.push_str(&format!("<a:tc gridSpan=\"{span}\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p>{run}</a:p></a:txBody>{TC_PR}</a:tc>"));
                 for _ in 1..span {
@@ -149,6 +149,7 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
 
         let scale_x = if p.width > 0.0 && p.width.is_finite() { (sw as f64) / (p.width * 12700.0) } else { 1.0 };
         let scale_y = if p.height > 0.0 && p.height.is_finite() { (sh as f64) / (p.height * 12700.0) } else { 1.0 };
+        let font_scale = scale_x.min(scale_y);
 
         let to_x = |pt: f64| -> i64 {
             let val = (pt * 12700.0 * scale_x).round();
@@ -180,7 +181,7 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
             let ty = to_y(title_block.rect[3]);
             let tw = to_w(title_block.rect[2] - title_block.rect[0]);
             let th = to_h(title_block.rect[3] - title_block.rect[1]);
-            let title_run = run_drawingml(&title_block.text, title_block.size, title_block.bold, title_block.italic, title_block.color);
+            let title_run = run_drawingml(&title_block.text, title_block.size * font_scale, title_block.bold, title_block.italic, title_block.color);
             shapes.push_str(&format!(
                 "<p:sp><p:nvSpPr><p:cNvPr id=\"{shape_id}\" name=\"Title {shape_id}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>\
 <p:spPr><a:xfrm><a:off x=\"{tx}\" y=\"{ty}\"/><a:ext cx=\"{tw}\" cy=\"{th}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>\
@@ -197,7 +198,7 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
                     let by = to_y(b.rect[3]);
                     let bw = to_w(b.rect[2] - b.rect[0]);
                     let bh = to_h(b.rect[3] - b.rect[1]);
-                    let run = run_drawingml(&b.text, b.size, b.bold, b.italic, b.color);
+                    let run = run_drawingml(&b.text, b.size * font_scale, b.bold, b.italic, b.color);
                     shapes.push_str(&format!(
                         "<p:sp><p:nvSpPr><p:cNvPr id=\"{shape_id}\" name=\"TextBox {shape_id}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>\
 <p:spPr><a:xfrm><a:off x=\"{bx}\" y=\"{by}\"/><a:ext cx=\"{bw}\" cy=\"{bh}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>\
@@ -230,7 +231,7 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
                     let tbl_x = to_x(t.rect[0]);
                     let tbl_y = to_y(t.rect[3]);
                     let tbl_w = to_w(t.rect[2] - t.rect[0]);
-                    let (table_xml, _) = pptx_table(shape_id, t, tbl_x, tbl_y, tbl_w);
+                    let (table_xml, _) = pptx_table(shape_id, t, tbl_x, tbl_y, tbl_w, font_scale);
                     shapes.push_str(&table_xml);
                     shape_id += 1;
                     i += 1;

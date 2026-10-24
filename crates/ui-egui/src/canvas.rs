@@ -3213,7 +3213,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         line_base.y = 0.0;
         boost_extra.y = 0.0;
     }
-    let texture_ready = view.pages.contains_key(&view.current) || view.errors.contains_key(&view.current);
+    let texture_ready = view.continuous || view.pages.contains_key(&view.current) || view.errors.contains_key(&view.current);
     if !texture_ready {
         ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
         precise_scroll = Vec2::ZERO;
@@ -4813,7 +4813,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         view.fling.moved((scroll_offset - view.last_scroll).length() > 0.01);
     }
     view.last_scroll = scroll_offset;
-    if view.pages.contains_key(&view.current) {
+    if view.pages.contains_key(&view.current) || view.errors.contains_key(&view.current) {
         view.single_page_target_y = None;
     }
     let pan_held = now_settle < view.pan_hold_until;
@@ -5551,13 +5551,14 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     // Clicking the same focused barcode again toggles the HUD closed
                     view.barcode_hud.panel_open = false;
                 } else {
-                    // Clicking a barcode focuses it, rescans with tight bounds, and opens HUD
+                    // Clicking a barcode focuses it, schedules a fresh background scan, and opens HUD
                     view.barcode_hud.open = true;
                     view.barcode_hud.panel_open = true;
                     view.barcode_hud.target_rect = Some(target_rect);
-                    let codes = doc.scan_page_codes(current_page);
-                    view.barcode_hud.update_codes_conditional(codes, true);
+                    view.barcode_hud.active_index = idx;
+                    view.barcode_hud.last_scanned_page = None;
                     view.barcode_hud.edit_buffer = None;
+                    ui.ctx().request_repaint();
                 }
             }
         }
