@@ -567,7 +567,11 @@ impl PdfCraftApp {
         // back whichever one the document refuses: typed text must not be lost.
         let (draft, select_added, editor) = (view.content.draft.clone(), view.content.select_added, view.line_editor.clone());
         let added = view.content.finish_draft(doc.added());
-        let paragraph = view.line_editor.take_if(|ed| ed.has_changes()).and_then(crate::edit_text_ui::finished_edit);
+        let reflow = view.reflow_paragraphs;
+        let paragraph = view.line_editor.take_if(|ed| ed.has_changes()).and_then(|ed| {
+            let blocks = doc.text_blocks(ed.page);
+            crate::edit_text_ui::finished_edit(ed, reflow, Some(&blocks))
+        });
         let added_ok = added.is_none_or(|edit| self.apply_edit(edit));
         let paragraph_ok = paragraph.is_none_or(|edit| self.apply_edit(edit));
         if let Some(view) = self.views.iter_mut().find(|v| v.id == id) {
