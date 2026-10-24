@@ -832,6 +832,7 @@ impl BarcodeScannerHud {
 
                     pending_edit =
                         Some(Edit::AddImage { page: current_page, rect: Some(rect), name: filename.into(), bytes: Arc::new(png_bytes) });
+                    state.last_scanned_page = None;
                     state.show_toast(format!("{} placed on page!", kind.label()), now);
                 }
                 Err(e) => {

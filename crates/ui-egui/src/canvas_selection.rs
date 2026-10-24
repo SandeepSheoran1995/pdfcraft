@@ -231,6 +231,8 @@ pub struct SelectionState {
     pub drag_start: Option<Pos2>,
     /// User rectangle when handle drag began.
     pub drag_start_rect: Option<[f64; 4]>,
+    /// Retained locked axis for Shift-drag: true for horizontal, false for vertical.
+    pub drag_lock_axis: Option<bool>,
     /// Format painter clipboard holding captured formatting.
     pub format_painter: Option<CapturedFormat>,
     /// Whether the symbol palette modal is open.
@@ -246,6 +248,7 @@ impl SelectionState {
         self.active_handle = None;
         self.drag_start = None;
         self.drag_start_rect = None;
+        self.drag_lock_axis = None;
         self.symbol_palette_open = false;
     }
 
@@ -347,17 +350,30 @@ impl SelectionLayoutEngine {
                 }
 
                 if resp.drag_started() {
+                    state.drag_start = ui.input(|i| i.pointer.interact_pos());
                     state.drag_start_rect = Some(sel.user_rect);
+                    state.drag_lock_axis = None;
                 }
 
                 if resp.dragged() {
                     let mut delta = resp.drag_delta();
                     if ui.input(|i| i.modifiers.shift) {
-                        if delta.x.abs() > delta.y.abs() {
+                        let lock = state.drag_lock_axis.get_or_insert_with(|| {
+                            if let (Some(start), Some(curr)) = (state.drag_start, ui.input(|i| i.pointer.interact_pos())) {
+                                let total = curr - start;
+                                if total.x.abs() > 2.0 || total.y.abs() > 2.0 {
+                                    return total.x.abs() >= total.y.abs();
+                                }
+                            }
+                            delta.x.abs() >= delta.y.abs()
+                        });
+                        if *lock {
                             delta.y = 0.0;
                         } else {
                             delta.x = 0.0;
                         }
+                    } else {
+                        state.drag_lock_axis = None;
                     }
                     if delta != egui::Vec2::ZERO {
                         handle_dragged = Some((handle, delta));
@@ -366,6 +382,8 @@ impl SelectionLayoutEngine {
 
                 if resp.drag_stopped() {
                     drag_stopped = true;
+                    state.drag_start = None;
+                    state.drag_lock_axis = None;
                 }
             }
 
@@ -402,6 +420,8 @@ impl SelectionLayoutEngine {
             }
 
             if drag_stopped {
+                state.drag_start = None;
+                state.drag_lock_axis = None;
                 let start_rect = state.drag_start_rect.take().unwrap_or(sel.user_rect);
                 let offset = [sel.user_rect[0] - start_rect[0], sel.user_rect[1] - start_rect[1]];
                 match sel.kind {

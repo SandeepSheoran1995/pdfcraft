@@ -111,6 +111,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
     for (page_index, p) in pages.iter().enumerate() {
         let (tables, consumed) = crate::tables(&p.blocks);
         let mut rows: Vec<XlsxRow> = Vec::new();
+        let mut row_tops: Vec<(f64, usize)> = Vec::new();
         let mut merges: Vec<String> = Vec::new();
         let mut col_max_len: Vec<usize> = Vec::new();
 
@@ -154,6 +155,12 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
 
         // Emit header / non-table blocks
         for mut group in line_groups {
+            let group_top_pt = if p.height > 0.0 {
+                let max_y = group.iter().map(|b| b.rect[3]).fold(0.0, f64::max);
+                (p.height - max_y).max(0.0)
+            } else {
+                0.0
+            };
             group.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
             let mut cells = Vec::new();
             let mut last_col = 0usize;
@@ -179,6 +186,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
                 cells.push(XlsxCell { col, text, num, style });
             }
             if !cells.is_empty() {
+                row_tops.push((group_top_pt, current_row));
                 rows.push(XlsxRow { row_num: current_row, cells });
                 current_row += 1;
             }
@@ -191,7 +199,11 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
 
         // Process detected tables
         for t in tables {
+            let t_height = (t.rect[3] - t.rect[1]).max(0.0);
+            let row_h = if !t.rows.is_empty() { t_height / t.rows.len() as f64 } else { 20.0 };
             for (row_idx, row) in t.rows.iter().enumerate() {
+                let row_top_y = t.rect[3] - (row_idx as f64) * row_h;
+                let row_top_pt = if p.height > 0.0 { (p.height - row_top_y).max(0.0) } else { 0.0 };
                 let is_header = row_idx == 0;
                 let is_last = row_idx + 1 == t.rows.len();
                 let mut col_cursor = 1usize;
@@ -233,6 +245,7 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
                     col_cursor += span;
                 }
 
+                row_tops.push((row_top_pt, current_row));
                 rows.push(XlsxRow { row_num: current_row, cells });
                 current_row += 1;
             }
@@ -287,18 +300,62 @@ pub fn xlsx(pages: &[Page], title: &str) -> Vec<u8> {
                 let media_name = format!("image{global_image_counter}.{ext}");
                 media_files.push((media_name.clone(), im.bytes.to_vec()));
 
-                let (w, h) = ((im.rect[2] - im.rect[0]).max(10.0), (im.rect[3] - im.rect[1]).max(10.0));
+                let rotated = im.rotation.abs() > f64::EPSILON;
+                let (w, h) = if rotated {
+                    (im.size[0].max(10.0), im.size[1].max(10.0))
+                } else {
+                    ((im.rect[2] - im.rect[0]).max(10.0), (im.rect[3] - im.rect[1]).max(10.0))
+                };
                 let cx = (w * 12700.0).round() as i64;
                 let cy = (h * 12700.0).round() as i64;
-                let col = (im.rect[0] / 64.0).floor().clamp(0.0, 50.0) as usize;
+                let rot_attr = if rotated {
+                    format!(" rot=\"{}\"", ((-im.rotation).rem_euclid(360.0) * 60000.0).round() as i64)
+                } else {
+                    String::new()
+                };
+
+                let natural_col = col_edges.iter().position(|&e| (im.rect[0] - e).abs() <= 16.0);
+                let col = natural_col.unwrap_or_else(|| (im.rect[0] / 64.0).floor().clamp(0.0, 50.0) as usize);
                 let top_pt = if p.height > 0.0 { (p.height - im.rect[3]).max(0.0) } else { 0.0 };
-                let row = (top_pt / 20.0).floor().clamp(0.0, 500.0) as usize;
+
+                let (row, row_off) = if row_tops.is_empty() {
+                    let r = (top_pt / 20.0).floor().clamp(0.0, 500.0) as usize;
+                    let off = ((top_pt % 20.0) * 12700.0).round() as i64;
+                    (r, off)
+                } else if top_pt <= row_tops[0].0 {
+                    (0, (top_pt * 12700.0).round() as i64)
+                } else if top_pt >= row_tops.last().map(|(pt, _)| *pt).unwrap_or(0.0) {
+                    let last_r = row_tops.last().map(|(_, r)| *r).unwrap_or(1);
+                    let target_row = last_r.max(current_row.saturating_sub(1));
+                    (target_row.saturating_sub(1), 0i64)
+                } else {
+                    let mut chosen_row = 0usize;
+                    let mut chosen_off = 0i64;
+                    for i in 0..row_tops.len().saturating_sub(1) {
+                        let (pt_a, r_a) = row_tops[i];
+                        let (pt_b, r_b) = row_tops[i + 1];
+                        if top_pt >= pt_a && top_pt <= pt_b {
+                            let frac = if (pt_b - pt_a) > 0.1 {
+                                (top_pt - pt_a) / (pt_b - pt_a)
+                            } else {
+                                0.0
+                            };
+                            let row_span = r_b.saturating_sub(r_a) as f64;
+                            let target_r = (r_a as f64) + frac * row_span;
+                            let mapped_row = target_r.floor() as usize;
+                            let mapped_frac = target_r - (mapped_row as f64);
+                            chosen_row = mapped_row.saturating_sub(1);
+                            chosen_off = (mapped_frac * 20.0 * 12700.0).round() as i64;
+                            break;
+                        }
+                    }
+                    (chosen_row, chosen_off)
+                };
                 let col_off = ((im.rect[0] % 64.0) * 12700.0).round() as i64;
-                let row_off = ((top_pt % 20.0) * 12700.0).round() as i64;
 
                 let r_id = local_idx + 1;
                 drw_xml.push_str(&format!(
-                    "<xdr:oneCellAnchor><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>{col_off}</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>{row_off}</xdr:rowOff></xdr:from><xdr:ext cx=\"{cx}\" cy=\"{cy}\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{global_image_counter}\" name=\"Picture {global_image_counter}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rIdImg{r_id}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"
+                    "<xdr:oneCellAnchor><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>{col_off}</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>{row_off}</xdr:rowOff></xdr:from><xdr:ext cx=\"{cx}\" cy=\"{cy}\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{global_image_counter}\" name=\"Picture {global_image_counter}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rIdImg{r_id}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm{rot_attr}><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"
                 ));
                 drw_rels.push_str(&format!(
                     "<Relationship Id=\"rIdImg{r_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{media_name}\"/>"

@@ -2533,3 +2533,17 @@ animation effects	Off	Aus
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Heute
+
+# Background tint and eye-strain settings
+	Page background: {mode} (click to cycle, right-click for tint settings)	Seitenhintergrund: {mode} (Klicken zum Wechseln, Rechtsklick für Farbton-Einstellungen)
+	Eye strain background: {mode} (click to cycle, right-click for tint settings)	Augenschonender Hintergrund: {mode} (Klicken zum Wechseln, Rechtsklick für Farbton-Einstellungen)
+	Background color & tint settings	Hintergrundfarbe & Farbton-Einstellungen
+	Page Background & Tint	Seitenhintergrund & Farbton
+	Tint Strength	Deckkraft
+	Preset Swatches	Farbfelder
+	White	Weiß
+	Warm Sepia	Warmes Sepia
+	Grey	Grau
+	Dark Grey	Dunkelgrau
+	Pure Black	Reines Schwarz
+	Custom Color	Benutzerdefinierte Farbe

@@ -693,7 +693,10 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         view.goto = Some((view.current, 0.0));
                     }
                     if ui.available_height() >= 220.0 {
-                        let bg_tip = format!("Page background: {} (click to cycle, right-click for tint settings)", bg_mode.label());
+                        let bg_tip = crate::i18n::fmt(
+                            tl!("Page background: {mode} (click to cycle, right-click for tint settings)"),
+                            &[("mode", tl!(bg_mode.label()))],
+                        );
                         let bg_active = bg_mode != PageBackground::Default;
                         let resp = icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip);
                         if resp.clicked() {
@@ -704,7 +707,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                             toggle_picker = true;
                         }
                         if bg_active {
-                            let swatch_tip = "Background color & tint settings";
+                            let swatch_tip = tl!("Background color & tint settings");
                             if icons::button(ui, "palette", 30.0, bg_picker_open, swatch_tip).clicked() {
                                 toggle_picker = true;
                             }
@@ -846,10 +849,10 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             if app.reading_bg.picker_open {
                 let reading_bg = &mut app.reading_bg;
                 let mut open = reading_bg.picker_open;
-                egui::Window::new("Page Background & Tint").open(&mut open).resizable(false).collapsible(false).default_width(260.0).show(
+                egui::Window::new(tl!("Page Background & Tint")).open(&mut open).resizable(false).collapsible(false).default_width(260.0).show(
                     ui.ctx(),
                     |ui| {
-                        ui.label(egui::RichText::new("Tint Strength").font(theme::semibold(12.0)));
+                        ui.label(egui::RichText::new(tl!("Tint Strength")).font(theme::semibold(12.0)));
                         let mut percent = (reading_bg.tint_strength * 100.0).round();
                         if ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%").step_by(1.0)).changed() {
                             reading_bg.tint_strength = (percent / 100.0).clamp(0.0, 1.0);
@@ -859,13 +862,13 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                             ui.ctx().request_repaint();
                         }
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Preset Swatches").font(theme::semibold(12.0)));
+                        ui.label(egui::RichText::new(tl!("Preset Swatches")).font(theme::semibold(12.0)));
                         let presets = [
-                            ("White", Color32::WHITE),
-                            ("Warm Sepia", Color32::from_rgb(250, 240, 215)),
-                            ("Grey", Color32::from_rgb(160, 160, 160)),
-                            ("Dark Grey", Color32::from_rgb(0x1E, 0x1E, 0x1E)),
-                            ("Pure Black", Color32::BLACK),
+                            (tl!("White"), Color32::WHITE),
+                            (tl!("Warm Sepia"), Color32::from_rgb(250, 240, 215)),
+                            (tl!("Grey"), Color32::from_rgb(160, 160, 160)),
+                            (tl!("Dark Grey"), Color32::from_rgb(0x1E, 0x1E, 0x1E)),
+                            (tl!("Pure Black"), Color32::BLACK),
                         ];
                         ui.horizontal(|ui| {
                             for (name, color) in presets {
@@ -887,7 +890,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                             }
                         });
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Custom Color").font(theme::semibold(12.0)));
+                        ui.label(egui::RichText::new(tl!("Custom Color")).font(theme::semibold(12.0)));
                         if egui::color_picker::color_picker_color32(ui, &mut reading_bg.color, egui::color_picker::Alpha::Opaque) {
                             if reading_bg.mode == PageBackground::Default {
                                 reading_bg.mode = PageBackground::Dark;

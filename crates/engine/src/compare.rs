@@ -187,13 +187,14 @@ impl crate::Document {
     /// The pages as paragraphs and images (for Word, HTML and RTF export), including what
     /// form XObjects draw.
     pub fn export_pages(&self) -> Vec<pdfcraft_export::Page> {
-        self.export_pages_checked(true, MAX_EXPORT_IMAGE_BYTES).0
+        self.export_pages_checked(true, MAX_EXPORT_IMAGE_BYTES, false).0
     }
 
     /// [`Self::export_pages`], and the pages whose forms were left partly unread or whose
     /// pictures went past `image_budget` bytes ([`OfficeExport::truncated_pages`]). Without
-    /// `images` no picture is prepared.
-    pub(crate) fn export_pages_checked(&self, images: bool, image_budget: usize) -> (Vec<pdfcraft_export::Page>, Vec<usize>) {
+    /// `images` no picture is prepared. If `split_rows` is true, multi-row text blocks are
+    /// split into separate visual-row blocks (used for XLSX cell mapping).
+    pub(crate) fn export_pages_checked(&self, images: bool, image_budget: usize, split_rows: bool) -> (Vec<pdfcraft_export::Page>, Vec<usize>) {
         let Some(cos) = self.editor.as_ref().map(|e| &e.cos) else { return (Vec::new(), Vec::new()) };
         let mut truncated = Vec::new();
         // Each image object is encoded once and shared by every place that draws it.
@@ -227,7 +228,7 @@ impl crate::Document {
                     let italic = f.contains("italic") || f.contains("oblique") || b.italic;
                     let rotation = b.rotation - f64::from(info.rotation);
 
-                    if b.rows.len() > 1 {
+                    if split_rows && b.rows.len() > 1 {
                         for row_indices in &b.rows {
                             let mut row_rect: Option<[f64; 4]> = None;
                             let mut row_text = String::new();
@@ -310,8 +311,8 @@ impl crate::Document {
     /// [`Self::export_office`], and the pages whose text it had to leave out
     /// ([`OfficeExport::truncated_pages`]).
     pub fn export_office_checked(&self, format: OfficeFormat) -> OfficeExport {
-        // RTF leaves pictures out.
-        let (pages, truncated_pages) = self.export_pages_checked(format != OfficeFormat::Rtf, MAX_EXPORT_IMAGE_BYTES);
+        // RTF leaves pictures out. Only XLSX splits multi-line blocks into row-level cells.
+        let (pages, truncated_pages) = self.export_pages_checked(format != OfficeFormat::Rtf, MAX_EXPORT_IMAGE_BYTES, format == OfficeFormat::Xlsx);
         let title = self.info.title.clone().unwrap_or_else(|| self.name.trim_end_matches(".pdf").to_string());
         let bytes = match format {
             OfficeFormat::Docx => pdfcraft_export::docx(&pages, &title),

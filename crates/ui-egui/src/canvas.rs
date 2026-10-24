@@ -6795,7 +6795,10 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                     // Reading Eye-Strain Background Tint
                     let bg_mode = app.reading_bg.mode;
                     let bg_active = bg_mode != PageBackground::Default;
-                    let bg_tip = format!("Eye strain background: {} (click to cycle, right-click for tint settings)", bg_mode.label());
+                    let bg_tip = crate::i18n::fmt(
+                        tl!("Eye strain background: {mode} (click to cycle, right-click for tint settings)"),
+                        &[("mode", tl!(bg_mode.label()))],
+                    );
                     let bg_resp = icons::button(ui, bg_mode.icon(), 32.0, bg_active, &bg_tip);
                     if bg_resp.clicked() {
                         app.reading_bg.mode = app.reading_bg.mode.next();
