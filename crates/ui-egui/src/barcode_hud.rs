@@ -323,13 +323,15 @@ struct FloatingMenuAnchor<'a> {
 
 fn render_floating_menu(
     ui: &mut egui::Ui,
+    doc: &Document,
     state: &BarcodeHudState,
     anchor: FloatingMenuAnchor<'_>,
     info: &DocInfo,
     can_modify: bool,
-) -> (Option<ScannedCode>, Option<ScannedCode>) {
+) -> (Option<ScannedCode>, Option<ScannedCode>, Option<(ScannedCode, pdfcraft_engine::ArrangeOrder)>) {
     let mut delete_code = None;
     let mut download_code = None;
+    let mut arrange_code = None;
 
     let FloatingMenuAnchor { current_page, page_xf, viewport, view_id } = anchor;
 
@@ -337,11 +339,13 @@ fn render_floating_menu(
         && active.page == current_page
         && let Some(xf) = page_xf
     {
+        let can_arrange = can_modify && whole_image_index(active, doc).is_some();
         let code_rect = xf.user_rect(info, current_page, active.rect.map(|v| v as f32));
+        let est_w = if can_arrange { 290.0 } else { 150.0 };
         let min_x = viewport.left() + 10.0;
-        let max_x = (viewport.right() - 150.0).max(min_x);
+        let max_x = (viewport.right() - est_w).max(min_x);
         let menu_pos = pos2(
-            (code_rect.center().x - 70.0).clamp(min_x, max_x),
+            (code_rect.center().x - est_w * 0.5).clamp(min_x, max_x),
             if code_rect.bottom() + 44.0 <= viewport.bottom() {
                 code_rect.bottom() + 10.0
             } else {
@@ -384,12 +388,24 @@ fn render_floating_menu(
                             ) {
                                 download_code = Some(active.clone());
                             }
+                            if can_arrange {
+                                if clicked(
+                                    &Button::new(tl!("To Front")).id_salt("to-front").variant(Variant::GHOST).tooltip(tl!("Bring to front")).show(ui),
+                                ) {
+                                    arrange_code = Some((active.clone(), pdfcraft_engine::ArrangeOrder::BringToFront));
+                                }
+                                if clicked(
+                                    &Button::new(tl!("To Back")).id_salt("to-back").variant(Variant::GHOST).tooltip(tl!("Send to back")).show(ui),
+                                ) {
+                                    arrange_code = Some((active.clone(), pdfcraft_engine::ArrangeOrder::SendToBack));
+                                }
+                            }
                         });
                     });
             });
     }
 
-    (delete_code, download_code)
+    (delete_code, download_code, arrange_code)
 }
 
 impl BarcodeScannerHud {
@@ -568,7 +584,7 @@ impl BarcodeScannerHud {
         }
 
         let anchor = FloatingMenuAnchor { current_page, page_xf: page_xf.as_ref(), viewport, view_id };
-        let (menu_delete, download_code) = render_floating_menu(ui, state, anchor, info, can_modify);
+        let (menu_delete, download_code, arrange_code) = render_floating_menu(ui, doc, state, anchor, info, can_modify);
         if menu_delete.is_some() {
             actions.delete_code = menu_delete;
         }
@@ -619,6 +635,22 @@ impl BarcodeScannerHud {
             state.reembed_kind = None;
             state.show_toast(tl!("White layer baked and original vector graphics removed!").to_string(), now);
             pending_edit = Some(Edit::BakeBarcodeWhiteout { page: hud_page, rects: whiteout_rects });
+        }
+        if let Some((active, order)) = arrange_code
+            && let Some(image_idx) = whole_image_index(&active, doc)
+        {
+            state.target_rect = Some(active.rect);
+            state.select_embedded_image = true;
+            state.page_codes.remove(&active.page);
+            state.last_scanned_page = None;
+            let toast = match order {
+                pdfcraft_engine::ArrangeOrder::BringToFront => tl!("Code brought to front"),
+                pdfcraft_engine::ArrangeOrder::SendToBack => tl!("Code sent to back"),
+                pdfcraft_engine::ArrangeOrder::BringForward => tl!("Code brought forward"),
+                pdfcraft_engine::ArrangeOrder::SendBackward => tl!("Code sent backward"),
+            };
+            state.show_toast(toast.to_string(), now);
+            pending_edit = Some(Edit::EditPageImage { page: active.page, index: image_idx, change: pdfcraft_engine::ImageEdit::Arrange(order) });
         }
         if let Some(active) = actions.delete_code {
             let target_page = active.page;

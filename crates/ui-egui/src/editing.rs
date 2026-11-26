@@ -1152,6 +1152,18 @@ fn re_resolve_image_selection(
             view.session.image_selection = None;
         }
     }
+    if let Some(sel) =
+        view.session.canvas_selection.selected.as_mut().filter(|s| s.kind == crate::canvas_selection::SelectableKind::Image && s.page == page)
+    {
+        if let Some(idx) = new_idx {
+            sel.index = idx;
+            if let Some(img) = page_images.get(idx) {
+                sel.user_rect = img.rect;
+            }
+        } else {
+            view.session.canvas_selection.selected = None;
+        }
+    }
 }
 
 /// The single page a content edit changes (`None` for other edits). Like comment edits,
@@ -1160,6 +1172,7 @@ fn content_page(edit: &Edit) -> Option<usize> {
     match edit {
         Edit::MoveObjects { page, .. }
         | Edit::DeleteObjects { page, .. }
+        | Edit::ArrangeLine { page, .. }
         | Edit::EditTextLine { page, .. }
         | Edit::EditTextBlock { page, .. }
         | Edit::EditPageImage { page, .. }
@@ -1175,8 +1188,8 @@ fn content_page(edit: &Edit) -> Option<usize> {
 }
 
 fn is_vector_line_edit(edit: &Edit) -> bool {
-    matches!(edit, Edit::SetLineProperties { .. } | Edit::UpdateLineEndpoints { .. })
-        || matches!(edit, Edit::Batch { edits, .. } if !edits.is_empty() && edits.iter().all(|e| matches!(e, Edit::SetLineProperties { .. } | Edit::UpdateLineEndpoints { .. })))
+    matches!(edit, Edit::SetLineProperties { .. } | Edit::UpdateLineEndpoints { .. } | Edit::ArrangeLine { .. })
+        || matches!(edit, Edit::Batch { edits, .. } if !edits.is_empty() && edits.iter().all(|e| matches!(e, Edit::SetLineProperties { .. } | Edit::UpdateLineEndpoints { .. } | Edit::ArrangeLine { .. })))
 }
 
 fn dash_index_for_pattern(pat: &[f64]) -> usize {
@@ -1216,9 +1229,9 @@ fn sync_line_properties_from_edit(
 
 fn sync_after_line_edit(doc: &pdfcraft_engine::Document, view: &mut crate::DocView, edit: &Edit) {
     let page = match edit {
-        Edit::SetLineProperties { page, .. } | Edit::UpdateLineEndpoints { page, .. } => Some(*page),
+        Edit::SetLineProperties { page, .. } | Edit::UpdateLineEndpoints { page, .. } | Edit::ArrangeLine { page, .. } => Some(*page),
         Edit::Batch { edits, .. } => edits.iter().find_map(|e| match e {
-            Edit::SetLineProperties { page, .. } | Edit::UpdateLineEndpoints { page, .. } => Some(*page),
+            Edit::SetLineProperties { page, .. } | Edit::UpdateLineEndpoints { page, .. } | Edit::ArrangeLine { page, .. } => Some(*page),
             _ => None,
         }),
         _ => None,
@@ -1230,10 +1243,34 @@ fn sync_after_line_edit(doc: &pdfcraft_engine::Document, view: &mut crate::DocVi
         if let Some(sel) = view.session.canvas_selection.selected.as_mut()
             && sel.page == page
             && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
-            && let Some(updated) = lines_vec.iter().find(|l| l.index == sel.index)
         {
-            sel.user_rect = updated.bbox();
-            sel.line = Some(updated.clone());
+            let matched = if let Edit::ArrangeLine { order, .. } = edit
+                && let Some(prev) = sel.line.as_ref()
+            {
+                let eps = 0.25;
+                let eq = |l: &&pdfcraft_engine::LineSegment| {
+                    ((l.start[0] - prev.start[0]).abs() < eps
+                        && (l.start[1] - prev.start[1]).abs() < eps
+                        && (l.end[0] - prev.end[0]).abs() < eps
+                        && (l.end[1] - prev.end[1]).abs() < eps)
+                        || ((l.start[0] - prev.end[0]).abs() < eps
+                            && (l.start[1] - prev.end[1]).abs() < eps
+                            && (l.end[0] - prev.start[0]).abs() < eps
+                            && (l.end[1] - prev.start[1]).abs() < eps)
+                };
+                if matches!(order, pdfcraft_engine::ArrangeOrder::BringToFront | pdfcraft_engine::ArrangeOrder::BringForward) {
+                    lines_vec.iter().rev().find(eq)
+                } else {
+                    lines_vec.iter().find(eq)
+                }
+            } else {
+                lines_vec.iter().find(|l| l.index == sel.index)
+            };
+            if let Some(updated) = matched {
+                sel.index = updated.index;
+                sel.user_rect = updated.bbox();
+                sel.line = Some(updated.clone());
+            }
         }
     }
     let last_prop = match edit {

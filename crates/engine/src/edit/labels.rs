@@ -301,6 +301,12 @@ impl Edit {
             Edit::MoveObjects { objects, .. } => plural("Move object", "Move objects", objects.len()),
             Edit::UpdateLineEndpoints { .. } => Label::of("Move object"),
             Edit::SetLineProperties { .. } => Label::of("Edit content"),
+            Edit::ArrangeLine { order, .. } => Label::of(match order {
+                pdfcraft_edit::ArrangeOrder::BringToFront => "Bring to front",
+                pdfcraft_edit::ArrangeOrder::BringForward => "Bring forward",
+                pdfcraft_edit::ArrangeOrder::SendBackward => "Send backward",
+                pdfcraft_edit::ArrangeOrder::SendToBack => "Send to back",
+            }),
             Edit::EditPageImage { change, .. } => Label::of(match change {
                 ImageEdit::Move(_) => "Move image",
                 ImageEdit::Transform(_) => "Transform image",

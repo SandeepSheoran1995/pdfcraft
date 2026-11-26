@@ -2153,6 +2153,27 @@ fn handle_symbol_palette_and_hud(ui: &mut egui::Ui, view: &mut DocView, cx: &Sym
                     ui.ctx().copy_text(text.clone());
                 }
             }
+            crate::canvas_selection::FloatingMenuAction::Arrange(order) => {
+                if cx.can_modify
+                    && let Some(sel) = &view.session.canvas_selection.selected
+                {
+                    match sel.kind {
+                        crate::canvas_selection::SelectableKind::VectorLine => {
+                            let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: sel.index };
+                            view.session.pending_edit = Some(pdfcraft_engine::Edit::ArrangeLine { page: sel.page, target, order });
+                            view.session.pending_line_edit = true;
+                        }
+                        crate::canvas_selection::SelectableKind::Image => {
+                            view.session.pending_edit = Some(pdfcraft_engine::Edit::EditPageImage {
+                                page: sel.page,
+                                index: sel.index,
+                                change: pdfcraft_engine::ImageEdit::Arrange(order),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }

@@ -123,6 +123,7 @@ pub(crate) fn check_permission(edit: &Edit, p: &pdfcraft_cos::Permissions) -> Re
         | Edit::DeleteObjects { .. }
         | Edit::UpdateLineEndpoints { .. }
         | Edit::SetLineProperties { .. }
+        | Edit::ArrangeLine { .. }
         | Edit::DeleteContent { .. }
         | Edit::ReplaceImage { .. }
         | Edit::PasteContent { .. }
@@ -944,6 +945,9 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
         }
         Edit::SetLineProperties { page, target, color, width, dash } => {
             pdfcraft_edit::set_line_properties(doc, *page, *target, *color, *width, dash.clone())?;
+        }
+        Edit::ArrangeLine { page, target, order } => {
+            pdfcraft_edit::arrange_line(doc, *page, *target, *order)?;
         }
         Edit::EditTextBlock { page, block, text, style } => {
             pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;

@@ -453,6 +453,182 @@ pub fn update_line_endpoints(doc: &mut Document, page: usize, target: ObjectTarg
     Ok(())
 }
 
+fn active_dash_before(ops: &[Op], target_op_idx: usize) -> Option<(Vec<f64>, f64)> {
+    let mut stack: Vec<Option<(Vec<f64>, f64)>> = Vec::new();
+    let mut current: Option<(Vec<f64>, f64)> = None;
+    for op in ops.iter().take(target_op_idx) {
+        match op.op.as_slice() {
+            b"q" => stack.push(current.clone()),
+            b"Q" => {
+                if let Some(prev) = stack.pop() {
+                    current = prev;
+                }
+            }
+            b"d" => {
+                if let (Some(arr_obj), Some(phase)) = (op.operands.first(), op.num(1))
+                    && let Object::Array(items) = arr_obj
+                    && phase.is_finite()
+                    && phase >= 0.0
+                {
+                    let pat: Option<Vec<f64>> = items
+                        .iter()
+                        .map(|o| match o {
+                            Object::Real(v) => Some(*v),
+                            Object::Int(i) => Some(*i as f64),
+                            _ => None,
+                        })
+                        .map(|v| v.filter(|x| x.is_finite() && *x >= 0.0))
+                        .collect();
+                    if let Some(pat) = pat {
+                        current = if pat.is_empty() { None } else { Some((pat, phase)) };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    current
+}
+
+fn ops_leak_root_state(ops: &[Op]) -> bool {
+    let mut depth: isize = 0;
+    for op in ops {
+        match op.op.as_slice() {
+            b"q" => depth += 1,
+            b"Q" => depth -= 1,
+            b"cm" | b"W" | b"W*" if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    depth != 0
+}
+
+/// Change stacking order of a vector line segment on `page` (e.g. Bring to Front / Send to Back).
+pub fn arrange_line(doc: &mut Document, page: usize, target: ObjectTarget, order: crate::ArrangeOrder) -> Result<(), EditError> {
+    if target.kind != ObjectKind::VectorLine {
+        return Err(EditError::Invalid("expected target kind VectorLine".into()));
+    }
+    let p = pdfcraft_model::pages(doc).into_iter().nth(page).ok_or(EditError::NoSuchPage(page))?;
+    let streams = checked_streams(doc, page)?;
+    let parsed_lines = parse_page_lines(&streams)?;
+    let target_line = parsed_lines.get(target.index).ok_or_else(|| EditError::Invalid("line no longer exists".into()))?.clone();
+
+    let pieces = crate::text::joined(&streams);
+    let ops = pieces.parse().ops;
+    let stroke_op = ops.get(target_line.stroke_op_idx).ok_or_else(|| EditError::Invalid("line stroke operator missing".into()))?;
+    if !matches!(stroke_op.op.as_slice(), b"S" | b"s") {
+        return Err(EditError::Invalid("arranging a line within a filled or compound path is not supported".into()));
+    }
+
+    let dash = active_dash_before(&ops, target_line.stroke_op_idx);
+    let mut edits: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
+
+    if let Some((re_idx, edge_idx)) = target_line.re_info {
+        let re_op = ops.get(re_idx).ok_or_else(|| EditError::Invalid("rectangle operator missing".into()))?;
+        let [x, y, w, h] = re_op.nums::<4>().ok_or_else(|| EditError::Invalid("invalid rectangle operands".into()))?;
+        let mut has_subsequent_path = false;
+        let mut subsequent_starts_with_m = false;
+        if let Some(sub) = ops.get((re_idx + 1)..target_line.stroke_op_idx) {
+            for op in sub {
+                if op.is("m") {
+                    if !has_subsequent_path {
+                        subsequent_starts_with_m = true;
+                    }
+                    has_subsequent_path = true;
+                } else if is_path_op(op) {
+                    has_subsequent_path = true;
+                    break;
+                }
+            }
+        }
+        if has_subsequent_path && !subsequent_starts_with_m {
+            return Err(EditError::Invalid("arranging an edge of a connected compound path is not supported".into()));
+        }
+        let corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        let pt = |k: usize| corners[k % 4];
+        let mut poly_ops = Vec::new();
+        if has_preceding_path_op(&ops, re_idx) {
+            poly_ops.push(Op::new("S", Vec::new()));
+        }
+        let p0 = pt(edge_idx + 1);
+        let p1 = pt(edge_idx + 2);
+        let p2 = pt(edge_idx + 3);
+        let p3 = pt(edge_idx);
+        poly_ops.push(Op::new("m", vec![pdfcraft_content::num(p0[0]), pdfcraft_content::num(p0[1])]));
+        poly_ops.push(Op::new("l", vec![pdfcraft_content::num(p1[0]), pdfcraft_content::num(p1[1])]));
+        poly_ops.push(Op::new("l", vec![pdfcraft_content::num(p2[0]), pdfcraft_content::num(p2[1])]));
+        poly_ops.push(Op::new("l", vec![pdfcraft_content::num(p3[0]), pdfcraft_content::num(p3[1])]));
+        poly_ops.push(Op::new("S", Vec::new()));
+        edits.push((re_op.span.clone(), pdfcraft_content::serialize_ops(&poly_ops)));
+        if !has_subsequent_path {
+            edits.push((stroke_op.span.clone(), Vec::new()));
+        }
+    } else {
+        let Some(m_op_idx) = target_line.m_op_idx else {
+            return Err(EditError::Invalid("arranging a line without a standalone moveto operator is not supported".into()));
+        };
+        let m_op = ops.get(m_op_idx).ok_or_else(|| EditError::Invalid("line moveto operator missing".into()))?;
+        let first_l_idx = *target_line.l_op_indices.first().ok_or_else(|| EditError::Invalid("line segment missing lineto operator".into()))?;
+        let last_l_idx = *target_line.l_op_indices.last().ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+        let last_l_op = ops.get(last_l_idx).ok_or_else(|| EditError::Invalid("line lineto operator missing".into()))?;
+        if last_l_idx >= target_line.stroke_op_idx {
+            return Err(EditError::Invalid("arranging a connected multi-segment path is not supported".into()));
+        }
+        let isolation = analyze_segment_isolation(&ops, m_op_idx, first_l_idx, last_l_idx, target_line.stroke_op_idx);
+        if isolation.has_connected_preceding || (isolation.has_subsequent_path && !isolation.subsequent_starts_with_m) {
+            return Err(EditError::Invalid("arranging a connected multi-segment path is not supported".into()));
+        }
+        if has_preceding_path_op(&ops, m_op_idx) {
+            edits.push((m_op.span.start..m_op.span.start, b"\nS\n".to_vec()));
+        }
+        edits.push((m_op.span.start..last_l_op.span.end, Vec::new()));
+        if !isolation.has_subsequent_path {
+            edits.push((stroke_op.span.clone(), Vec::new()));
+        }
+    }
+
+    let mut new_ops = vec![Op::new("q", Vec::new()), Op::new("w", vec![pdfcraft_content::num(target_line.thickness)])];
+    if let Some(c) = target_line.color {
+        new_ops.push(Op::new("RG", vec![pdfcraft_content::num(c[0]), pdfcraft_content::num(c[1]), pdfcraft_content::num(c[2])]));
+    }
+    if let Some((pat, phase)) = dash {
+        let arr = Object::Array(pat.into_iter().map(pdfcraft_content::num).collect());
+        new_ops.push(Op::new("d", vec![arr, pdfcraft_content::num(phase)]));
+    }
+    new_ops.push(Op::new("m", vec![pdfcraft_content::num(target_line.start[0]), pdfcraft_content::num(target_line.start[1])]));
+    new_ops.push(Op::new("l", vec![pdfcraft_content::num(target_line.end[0]), pdfcraft_content::num(target_line.end[1])]));
+    new_ops.push(Op::new("S", Vec::new()));
+    new_ops.push(Op::new("Q", Vec::new()));
+    let line_stream_bytes = pdfcraft_content::serialize_ops(&new_ops);
+
+    edits.sort_by_key(|(span, _)| span.start);
+    let data = pieces.splice(edits);
+    let rewritten = crate::text::rewritten_contents(doc, &streams, data)?;
+    let mut refs: Vec<Object> = match rewritten {
+        Object::Array(a) => a,
+        single => vec![single],
+    };
+    let line_ref = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(Dict::new(), &line_stream_bytes))));
+    let forward = matches!(order, crate::ArrangeOrder::BringToFront | crate::ArrangeOrder::BringForward);
+    if forward {
+        if ops_leak_root_state(&ops) {
+            let q_ref = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(Dict::new(), b"q\n"))));
+            let cap_q_ref = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(Dict::new(), b"\nQ\n"))));
+            refs.insert(0, q_ref);
+            refs.push(cap_q_ref);
+        }
+        refs.push(line_ref);
+    } else {
+        refs.insert(0, line_ref);
+    }
+    let contents = match <[Object; 1]>::try_from(refs) {
+        Ok([one]) => one,
+        Err(many) => Object::Array(many),
+    };
+    doc.update_dict(p.obj, |d| d.set(b"Contents".to_vec(), contents))?;
+    Ok(())
+}
+
 struct AddedGeometry {
     rect: [f64; 4],
     local_rect: [f64; 4],
@@ -1472,5 +1648,40 @@ mod line_tests {
         s.push_str("S\n");
         let lines = lines_for_stream_bytes(s.as_bytes()).unwrap();
         assert_eq!(lines.len(), 7_000);
+    }
+
+    #[test]
+    fn test_arrange_line_bring_to_front_moves_line_after_image_and_preserves_props() {
+        let mut doc = doc_with_stream(b"2 w 1 0 0 RG [4 2] 0 d 10 20 m 100 20 l S\n10 50 m 100 50 l S\n");
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 0 };
+        arrange_line(&mut doc, 0, target, crate::ArrangeOrder::BringToFront).unwrap();
+
+        let lines = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines.len(), 2);
+        // Moved line is now last in paint order (frontmost).
+        assert_eq!(lines[0].start, [10.0, 50.0]);
+        assert_eq!(lines[1].start, [10.0, 20.0]);
+        assert_eq!(lines[1].end, [100.0, 20.0]);
+        assert!((lines[1].thickness - 2.0).abs() < 1e-6);
+        assert_eq!(lines[1].stroke_color, Some([1.0, 0.0, 0.0]));
+
+        let streams = checked_streams(&doc, 0).unwrap();
+        let ops = crate::text::joined(&streams).parse().ops;
+        assert!(ops.iter().any(|op| op.is("d")), "dash pattern must survive BringToFront");
+    }
+
+    #[test]
+    fn test_arrange_line_send_to_back_splits_rect_edge_cleanly() {
+        let mut doc = doc_with_stream(b"1 w 0 0 0 RG 50 50 m 150 50 l S\n10 20 100 40 re S\n");
+        // Line 0 is [50,50]->[150,50]; lines 1..=4 are the 4 rectangle edges.
+        let target = ObjectTarget { kind: ObjectKind::VectorLine, index: 1 };
+        arrange_line(&mut doc, 0, target, crate::ArrangeOrder::SendToBack).unwrap();
+
+        let lines = editable_lines(&doc, 0).unwrap();
+        assert_eq!(lines.len(), 5);
+        // Split bottom edge [10,20]->[110,20] is now first in paint order (backmost).
+        assert_eq!(lines[0].start, [10.0, 20.0]);
+        assert_eq!(lines[0].end, [110.0, 20.0]);
+        assert_eq!(lines[0].rect_op, None);
     }
 }

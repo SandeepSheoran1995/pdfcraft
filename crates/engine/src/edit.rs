@@ -537,6 +537,12 @@ pub enum Edit {
         width: Option<f64>,
         dash: Option<Vec<f64>>,
     },
+    /// Change stacking order (Bring to Front / Send to Back) of a vector line on `page`.
+    ArrangeLine {
+        page: usize,
+        target: ObjectTarget,
+        order: crate::ArrangeOrder,
+    },
     /// Edit text in a paragraph box: replace paragraph `block` (from `Document::text_blocks`),
     /// rewrapped to the box's width.
     EditTextBlock {

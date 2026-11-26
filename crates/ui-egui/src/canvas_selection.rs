@@ -831,6 +831,8 @@ pub enum FloatingMenuAction {
     Duplicate,
     /// Toggle word-like paragraph reflow mode
     ToggleReflow,
+    /// Change stacking order (Bring to Front / Send to Back) of a selected line or image.
+    Arrange(pdfcraft_engine::ArrangeOrder),
 }
 
 /// Floating context menu and quick action toolbar anchored to canvas selections.
@@ -865,6 +867,10 @@ impl FloatingContextMenu {
     ///
     /// Shows a pill toolbar with Cut, Copy, Paste, Format Painter, Edit Text, Bold, Italic, Strikethrough, Symbols, and Delete icon buttons.
     pub fn show(ui: &mut egui::Ui, viewport: Rect, view: &DocView, info: &DocInfo, can_modify: bool, can_copy: bool) -> Option<FloatingMenuAction> {
+        use craft::theme::variant::Variant;
+        use craft::ui::buttons::Button;
+        use craft::ui::contract::clicked;
+
         if ui.is_sizing_pass() {
             return None;
         }
@@ -891,7 +897,7 @@ impl FloatingContextMenu {
             if !can_modify {
                 return None;
             }
-            let menu_width = 240.0;
+            let menu_width = 390.0;
             let menu_height = 36.0;
             let anchor = Self::compute_anchor(screen_rect, viewport, menu_width, menu_height)?;
             let mut action = None;
@@ -974,6 +980,24 @@ impl FloatingContextMenu {
                             {
                                 action = Some(FloatingMenuAction::SetDash(idx));
                             }
+
+                            ui.separator();
+
+                            // 4. Layer order (Front / Back)
+                            if clicked(
+                                &Button::new(tl!("To Front"))
+                                    .id_salt("line-to-front")
+                                    .variant(Variant::GHOST)
+                                    .tooltip(tl!("Bring to front"))
+                                    .show(ui),
+                            ) {
+                                action = Some(FloatingMenuAction::Arrange(pdfcraft_engine::ArrangeOrder::BringToFront));
+                            }
+                            if clicked(
+                                &Button::new(tl!("To Back")).id_salt("line-to-back").variant(Variant::GHOST).tooltip(tl!("Send to back")).show(ui),
+                            ) {
+                                action = Some(FloatingMenuAction::Arrange(pdfcraft_engine::ArrangeOrder::SendToBack));
+                            }
                         });
                     });
             });
@@ -981,7 +1005,13 @@ impl FloatingContextMenu {
             return action;
         }
 
-        let menu_width = if is_text { if is_line_editor { 70.0 } else { 180.0 } } else { 110.0 };
+        let menu_width = if is_text {
+            if is_line_editor { 70.0 } else { 180.0 }
+        } else if is_image {
+            260.0
+        } else {
+            110.0
+        };
         let menu_height = 36.0;
 
         let anchor = Self::compute_anchor(screen_rect, viewport, menu_width, menu_height)?;
@@ -1048,7 +1078,7 @@ impl FloatingContextMenu {
                             }
                         }
 
-                        // Image dimensions
+                        // Image dimensions and layer order
                         if is_image
                             && can_modify
                             && let Some(sel) = view.session.canvas_selection.selected.as_ref()
@@ -1056,6 +1086,17 @@ impl FloatingContextMenu {
                             let w = (sel.user_rect[2] - sel.user_rect[0]).abs();
                             let h = (sel.user_rect[3] - sel.user_rect[1]).abs();
                             Text::new(format!("{w:.0}×{h:.0}pt")).role(TypeRole::Caption).show(ui);
+                            ui.separator();
+                            if clicked(
+                                &Button::new(tl!("To Front")).id_salt("img-to-front").variant(Variant::GHOST).tooltip(tl!("Bring to front")).show(ui),
+                            ) {
+                                action = Some(FloatingMenuAction::Arrange(pdfcraft_engine::ArrangeOrder::BringToFront));
+                            }
+                            if clicked(
+                                &Button::new(tl!("To Back")).id_salt("img-to-back").variant(Variant::GHOST).tooltip(tl!("Send to back")).show(ui),
+                            ) {
+                                action = Some(FloatingMenuAction::Arrange(pdfcraft_engine::ArrangeOrder::SendToBack));
+                            }
                         }
 
                         // Separator before Delete

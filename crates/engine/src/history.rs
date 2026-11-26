@@ -92,6 +92,7 @@ pub(crate) fn scope_of(edit: &Edit) -> Scope {
         | Edit::DeleteObjects { .. }
         | Edit::UpdateLineEndpoints { .. }
         | Edit::SetLineProperties { .. }
+        | Edit::ArrangeLine { .. }
         | Edit::EditTextLine { .. }
         | Edit::EditTextBlock { .. }
         | Edit::PrepareText { .. }
