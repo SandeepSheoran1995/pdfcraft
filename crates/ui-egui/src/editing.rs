@@ -1168,7 +1168,8 @@ fn content_page(edit: &Edit) -> Option<usize> {
         | Edit::UpdateContent { page, .. }
         | Edit::DeleteContent { page, .. }
         | Edit::ReplaceImage { page, .. }
-        | Edit::PasteObjects { page, .. } => Some(*page),
+        | Edit::PasteObjects { page, .. }
+        | Edit::BakeBarcodeWhiteout { page, .. } => Some(*page),
         _ => None,
     }
 }

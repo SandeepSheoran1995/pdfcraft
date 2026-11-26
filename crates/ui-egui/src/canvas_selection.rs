@@ -540,6 +540,114 @@ impl SelectionLayoutEngine {
     }
 }
 
+fn apply_line_drag_delta(
+    ui: &egui::Ui,
+    target: &LineOverlayTarget<'_>,
+    line: &mut LineSegment,
+    drag_state: Option<(SelectionHandle, [f64; 2], [f64; 2])>,
+    handle: SelectionHandle,
+    drag_delta: egui::Vec2,
+) {
+    let LineOverlayTarget { page, xf, info } = *target;
+    if let (Some((_, orig_start, orig_end)), Some(press_origin), Some(curr_pos)) =
+        (drag_state, ui.input(|i| i.pointer.press_origin()), ui.input(|i| i.pointer.interact_pos()))
+    {
+        let p0 = screen_to_user_point(xf, info, page, press_origin);
+        let p1 = screen_to_user_point(xf, info, page, curr_pos);
+        let (dux, duy) = (p1[0] - p0[0], p1[1] - p0[1]);
+        match handle {
+            SelectionHandle::LineStart => line.start = [orig_start[0] + dux, orig_start[1] + duy],
+            SelectionHandle::LineEnd => line.end = [orig_end[0] + dux, orig_end[1] + duy],
+            SelectionHandle::Move => {
+                line.start = [orig_start[0] + dux, orig_start[1] + duy];
+                line.end = [orig_end[0] + dux, orig_end[1] + duy];
+            }
+            _ => {}
+        }
+    } else if drag_delta != egui::Vec2::ZERO {
+        let shift_point = |pt: [f64; 2]| {
+            let shifted = project_user_point(xf, info, page, pt) + drag_delta;
+            screen_to_user_point(xf, info, page, shifted)
+        };
+        match handle {
+            SelectionHandle::LineStart => line.start = shift_point(line.start),
+            SelectionHandle::LineEnd => line.end = shift_point(line.end),
+            SelectionHandle::Move => {
+                line.start = shift_point(line.start);
+                line.end = shift_point(line.end);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn preview_connected_lines(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    target: &LineOverlayTarget<'_>,
+    line: &LineSegment,
+    page_lines: &[LineSegment],
+    extend_perpendicular: bool,
+    drag_origin: Option<([f64; 2], [f64; 2])>,
+) {
+    if extend_perpendicular && let Some((orig_start, orig_end)) = drag_origin {
+        for upd in compute_connected_perpendicular_line_updates(page_lines, line.index, orig_start, orig_end, line.start, line.end) {
+            let preview = LineSegment {
+                page: target.page,
+                index: upd.index,
+                start: upd.new_start,
+                end: upd.new_end,
+                thickness: line.thickness,
+                stroke_color: None,
+                rect_op: None,
+            };
+            paint_line_highlight(ui, painter, &preview, LineHighlightState::Hover, target.xf, target.info);
+        }
+    }
+}
+
+fn commit_line_endpoints_edit(
+    page: usize,
+    line: &LineSegment,
+    page_lines: &[LineSegment],
+    extend_perpendicular: bool,
+    drag_origin: Option<([f64; 2], [f64; 2])>,
+) -> Edit {
+    let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: line.index };
+    let primary = Edit::UpdateLineEndpoints { page, target, new_start: line.start, new_end: line.end };
+    if extend_perpendicular && let Some((orig_start, orig_end)) = drag_origin {
+        let updates = compute_connected_perpendicular_line_updates(page_lines, line.index, orig_start, orig_end, line.start, line.end);
+        if !updates.is_empty() {
+            let mut edits = Vec::with_capacity(updates.len() + 1);
+            edits.push(primary);
+            for upd in updates {
+                edits.push(Edit::UpdateLineEndpoints { page, target: upd.target, new_start: upd.new_start, new_end: upd.new_end });
+            }
+            return Edit::Batch { label: "Edit connected lines".into(), edits };
+        }
+    }
+    primary
+}
+
+/// Translate the selected vector line element by `offset` (PDF user space) and produce the commit edit.
+pub fn move_selected_line_by(
+    page: usize,
+    sel: &mut SelectableElement,
+    page_lines: &[LineSegment],
+    extend_perpendicular: bool,
+    offset: [f64; 2],
+) -> Option<Edit> {
+    if sel.kind != SelectableKind::VectorLine {
+        return None;
+    }
+    let line = sel.line.as_mut()?;
+    let orig = (line.start, line.end);
+    line.start = [orig.0[0] + offset[0], orig.0[1] + offset[1]];
+    line.end = [orig.1[0] + offset[0], orig.1[1] + offset[1]];
+    sel.user_rect = line.bbox();
+    Some(commit_line_endpoints_edit(page, line, page_lines, extend_perpendicular, Some(orig)))
+}
+
 fn handle_vector_line_overlay(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -553,73 +661,58 @@ fn handle_vector_line_overlay(
     paint_line_highlight(ui, painter, line, LineHighlightState::Selected, xf, info);
     paint_line_endpoint_handles(ui, painter, line, xf, info, 7.0);
 
+    let mut endpoint_active = false;
     for (handle_idx, (handle, h_rect)) in line_endpoint_handles(line, xf, info, 7.0).into_iter().enumerate() {
         let handle_id = ui.scope_id().with(("line_handle", sel.index, handle_idx));
         let resp = ui.interact(h_rect.expand(4.0), handle_id, egui::Sense::drag());
         if resp.hovered() || resp.dragged() {
+            endpoint_active = true;
             ui.ctx().set_cursor_icon(handle.cursor_icon());
         }
         if resp.drag_started() {
             *line_drag = Some((handle, line.start, line.end));
         }
         if resp.dragged() {
-            if let (Some((_, orig_start, orig_end)), Some(press_origin), Some(curr_pos)) =
-                (*line_drag, ui.input(|i| i.pointer.press_origin()), ui.input(|i| i.pointer.interact_pos()))
-            {
-                let p0 = screen_to_user_point(xf, info, page, press_origin);
-                let p1 = screen_to_user_point(xf, info, page, curr_pos);
-                let (dux, duy) = (p1[0] - p0[0], p1[1] - p0[1]);
-                match handle {
-                    SelectionHandle::LineStart => line.start = [orig_start[0] + dux, orig_start[1] + duy],
-                    SelectionHandle::LineEnd => line.end = [orig_end[0] + dux, orig_end[1] + duy],
-                    _ => {}
-                }
-            } else if resp.drag_delta() != egui::Vec2::ZERO {
-                let endpoint = match handle {
-                    SelectionHandle::LineStart => line.start,
-                    SelectionHandle::LineEnd => line.end,
-                    _ => continue,
-                };
-                let shifted = project_user_point(xf, info, page, endpoint) + resp.drag_delta();
-                let user_pt = screen_to_user_point(xf, info, page, shifted);
-                match handle {
-                    SelectionHandle::LineStart => line.start = user_pt,
-                    SelectionHandle::LineEnd => line.end = user_pt,
-                    _ => {}
-                }
-            }
+            apply_line_drag_delta(ui, &target, line, *line_drag, handle, resp.drag_delta());
             sel.user_rect = line.bbox();
-            if extend_perpendicular && let Some((_, orig_start, orig_end)) = *line_drag {
-                for upd in compute_connected_perpendicular_line_updates(page_lines, line.index, orig_start, orig_end, line.start, line.end) {
-                    let preview = LineSegment {
-                        page,
-                        index: upd.index,
-                        start: upd.new_start,
-                        end: upd.new_end,
-                        thickness: line.thickness,
-                        stroke_color: None,
-                        rect_op: None,
-                    };
-                    paint_line_highlight(ui, painter, &preview, LineHighlightState::Hover, xf, info);
-                }
-            }
+            preview_connected_lines(ui, painter, &target, line, page_lines, extend_perpendicular, line_drag.map(|(_, s, e)| (s, e)));
         }
         if resp.drag_stopped() {
             let drag_origin = line_drag.take().map(|(_, s, e)| (s, e));
-            let target = pdfcraft_engine::ObjectTarget { kind: pdfcraft_engine::ObjectKind::VectorLine, index: line.index };
-            let primary = Edit::UpdateLineEndpoints { page, target, new_start: line.start, new_end: line.end };
-            if extend_perpendicular && let Some((orig_start, orig_end)) = drag_origin {
-                let updates = compute_connected_perpendicular_line_updates(page_lines, line.index, orig_start, orig_end, line.start, line.end);
-                if !updates.is_empty() {
-                    let mut edits = Vec::with_capacity(updates.len() + 1);
-                    edits.push(primary);
-                    for upd in updates {
-                        edits.push(Edit::UpdateLineEndpoints { page, target: upd.target, new_start: upd.new_start, new_end: upd.new_end });
-                    }
-                    return Some(Edit::Batch { label: "Edit connected lines".into(), edits });
-                }
+            return Some(commit_line_endpoints_edit(page, line, page_lines, extend_perpendicular, drag_origin));
+        }
+    }
+
+    let body_dragging = matches!(*line_drag, Some((SelectionHandle::Move, _, _)));
+    if !endpoint_active || body_dragging {
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+        let body_rect = if body_dragging {
+            let s = project_user_point(xf, info, page, line.start);
+            let e = project_user_point(xf, info, page, line.end);
+            Rect::from_two_pos(s, e).expand(12.0)
+        } else {
+            pointer_pos
+                .filter(|&pos| hit_test_line(pos, line, xf, info, 8.0))
+                .map_or(Rect::NOTHING, |pos| Rect::from_center_size(pos, vec2(18.0, 18.0)))
+        };
+        if body_rect != Rect::NOTHING {
+            let body_id = ui.scope_id().with(("line_body_drag", sel.index));
+            let resp = ui.interact(body_rect, body_id, egui::Sense::drag());
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(SelectionHandle::Move.cursor_icon());
             }
-            return Some(primary);
+            if resp.drag_started() {
+                *line_drag = Some((SelectionHandle::Move, line.start, line.end));
+            }
+            if resp.dragged() {
+                apply_line_drag_delta(ui, &target, line, *line_drag, SelectionHandle::Move, resp.drag_delta());
+                sel.user_rect = line.bbox();
+                preview_connected_lines(ui, painter, &target, line, page_lines, extend_perpendicular, line_drag.map(|(_, s, e)| (s, e)));
+            }
+            if resp.drag_stopped() {
+                let drag_origin = line_drag.take().map(|(_, s, e)| (s, e));
+                return Some(commit_line_endpoints_edit(page, line, page_lines, extend_perpendicular, drag_origin));
+            }
         }
     }
     None
@@ -772,6 +865,9 @@ impl FloatingContextMenu {
     ///
     /// Shows a pill toolbar with Cut, Copy, Paste, Format Painter, Edit Text, Bold, Italic, Strikethrough, Symbols, and Delete icon buttons.
     pub fn show(ui: &mut egui::Ui, viewport: Rect, view: &DocView, info: &DocInfo, can_modify: bool, can_copy: bool) -> Option<FloatingMenuAction> {
+        if ui.is_sizing_pass() {
+            return None;
+        }
         let (screen_rect, is_vector_line, is_text, is_image, is_line_editor, area_id) = if let Some(ed) = &view.session.line_editor {
             (ed.rect, false, true, false, true, ("floating-editor-menu", view.id.0, ed.page, ed.block))
         } else {
@@ -946,7 +1042,7 @@ impl FloatingContextMenu {
                                 } else {
                                     tl!("Paragraph Reflow: OFF (bottom paragraphs stay fixed) - click to toggle")
                                 };
-                                if IconButton::new(IconId::new("arrow-up-down")).label(reflow_tip).selected(reflow_on).show(ui).clicked() {
+                                if IconButton::new(IconId::new("swap_vertical")).label(reflow_tip).selected(reflow_on).show(ui).clicked() {
                                     action = Some(FloatingMenuAction::ToggleReflow);
                                 }
                             }

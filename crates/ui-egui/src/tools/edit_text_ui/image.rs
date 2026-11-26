@@ -266,6 +266,158 @@ pub(crate) fn picture_controls(
     edit
 }
 
+/// Transient preview state while dragging or resizing a vector barcode/QR code on canvas.
+pub(crate) struct VectorBarcodeDrag {
+    pub(crate) page: usize,
+    pub(crate) code_id: usize,
+    pub(crate) preview: Option<PreviewTextures>,
+    pub(crate) settled: Option<(Rect, Rect)>,
+    pub(crate) settled_generation: Option<u64>,
+}
+
+/// Interactive drag and corner-resize `TransformBox` handles for an existing vector QR/barcode
+/// (`active.image_index.is_none()`). On commit, captures a crisp raster copy at the new rectangle
+/// and bakes/erases the original vector graphics cleanly in one undoable batch.
+pub(crate) fn vector_barcode_controls(
+    ui: &mut egui::Ui,
+    body: &PageBody<'_>,
+    session: &mut PageSession,
+    doc: &pdfcraft_engine::Document,
+    info: &DocInfo,
+    geo: PageGeometry<'_>,
+) -> Option<Edit> {
+    let active = session.barcode_hud.active_code()?.clone();
+    if active.image_index.is_some() {
+        session.vector_code_drag = None;
+        return None;
+    }
+    let page = active.page;
+    let placed = body.pages.iter().find(|p| p.page == page && p.rect.intersects(geo.viewport))?;
+    let xf = geo.xform_of(placed);
+    let view = &body.view;
+
+    if let Some(d) = session.vector_code_drag.as_mut()
+        && (d.page != page || d.code_id != active.id || d.settled_generation.is_some_and(|g| g != doc.edit_generation()))
+    {
+        session.vector_code_drag = None;
+    }
+
+    let sr = xf.user_rect(info, page, active.rect.map(|v| v as f32));
+    if !sr.is_positive() {
+        return None;
+    }
+    let quad = [sr.left_top(), sr.right_top(), sr.right_bottom(), sr.left_bottom()].map(|p| view.to_doc(p));
+    let bounds = bounds_of(&quad);
+    let pivot = view.to_doc(sr.center());
+    let rules = BoxRules::in_mode(TransformMode::Free)
+        .with_scale(ScaleRule::LargerAxis)
+        .with_allow(BoxAllow::new(true, false, false))
+        .with_min_side(least_side(ui, placed));
+    let shown = TransformBox::new(tl!("Code"), Bind::given(BoxState::new(quad, pivot)), bounds, 0.0)
+        .rules(rules)
+        .reference_point(false)
+        .round_handles(true)
+        .session_arrows(false)
+        .show_at(ui, body.rect);
+
+    let mut edit = None;
+    for event in shown.edit.events.iter() {
+        match event {
+            EditEvent::Begin { .. } => {
+                let preview = doc.capture_region_rgba(page, active.rect).ok().and_then(|(w, h, rgba)| {
+                    let size = [usize::try_from(w).ok()?, usize::try_from(h).ok()?];
+                    if size[0] == 0 || size[1] == 0 || rgba.len() != size[0].checked_mul(size[1])?.checked_mul(4)? {
+                        return None;
+                    }
+                    let color = egui::ColorImage::from_rgba_premultiplied(size, &rgba);
+                    Some(PreviewTextures::new(
+                        &mut session.image_serials,
+                        format!("vector-code-{page}-{}", active.id),
+                        PreviewPixels::new(color, [1.0, 1.0]),
+                    ))
+                });
+                session.vector_code_drag = Some(VectorBarcodeDrag { page, code_id: active.id, preview, settled: None, settled_generation: None });
+            }
+            EditEvent::Commit { after, .. } => {
+                let changed = (0..4).any(|i| (after.quad[i] - quad[i]).hypot() >= EPS);
+                if changed && let Ok(png_bytes) = doc.capture_region_png(page, active.rect) {
+                    let end_user = after.quad.map(|p| screen_to_user(&xf, info, page, view.to_screen(p)));
+                    if end_user.iter().all(|(x, y)| x.is_finite() && y.is_finite()) {
+                        let new_user = [
+                            end_user.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                            end_user.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                            end_user.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                            end_user.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                        ];
+                        let old_erase = [active.rect[0] - 1.5, active.rect[1] - 1.5, active.rect[2] + 1.5, active.rect[3] + 1.5];
+                        let new_disp = crate::barcode_hud::display_rect(new_user, Some(info), page);
+                        session.barcode_hud.target_rect = Some(new_user);
+                        session.barcode_hud.select_embedded_image = true;
+                        session.barcode_hud.page_codes.remove(&page);
+                        session.barcode_hud.last_scanned_page = None;
+                        edit = Some(Edit::Batch {
+                            label: "Move code".into(),
+                            edits: vec![
+                                Edit::BakeBarcodeWhiteout { page, rects: vec![old_erase] },
+                                Edit::AddImage { page, rect: Some(new_disp), name: "MovedCode.png".into(), bytes: std::sync::Arc::new(png_bytes) },
+                            ],
+                        });
+                        if let Some(d) = session.vector_code_drag.as_mut() {
+                            d.settled = Some((norm_rect(view, &xf, bounds), norm_rect(view, &xf, bounds_of(&after.quad))));
+                            d.settled_generation = Some(doc.edit_generation());
+                        }
+                    }
+                }
+            }
+            EditEvent::Cancel { .. } => {
+                if let Some(d) = session.vector_code_drag.as_ref()
+                    && d.settled.is_none()
+                {
+                    session.vector_code_drag = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(d) = session.vector_code_drag.as_ref()
+        && let Some(textures) = d.preview.as_ref()
+    {
+        let from = d.settled.map_or(quad, |(f, _)| corners_of(doc_rect(view, &xf, f)));
+        let to = if shown.held.is_some() {
+            shown.edit.shown.as_ref().and_then(|m| m.same()).map_or(quad, |s| s.quad)
+        } else {
+            d.settled.map_or(quad, |(_, t)| corners_of(doc_rect(view, &xf, t)))
+        };
+        PicturePaper::new(from.map(|p| view.to_screen(p)), placed.rect).show_at(ui, body.rect);
+        let unit_clip = [Point::new(0.0, 0.0), Point::new(1.0, 0.0), Point::new(1.0, 1.0), Point::new(0.0, 1.0)];
+        let _ = TransformPreview::new(tl!("Code"), textures).map(PreviewMap::Quad(to)).source_clip(unit_clip).clip_quad(to).show_at(ui, body.rect);
+    }
+
+    edit
+}
+
+/// Interactive drag, resize, and crop handles for only the currently selected image (`session.image_selection`),
+/// without painting faint outlines over every other image on the page.
+pub(crate) fn active_picture_controls(
+    ui: &mut egui::Ui,
+    body: &PageBody<'_>,
+    session: &mut PageSession,
+    doc: &pdfcraft_engine::Document,
+    info: &DocInfo,
+    geo: PageGeometry<'_>,
+) -> Option<Edit> {
+    let sel_page = session.image_selection.as_ref()?.page;
+    let placed = body.pages.iter().find(|placed| placed.page == sel_page && placed.rect.intersects(geo.viewport))?;
+    let xf = geo.xform_of(placed);
+    let images = doc.page_images(placed.page);
+    let index = session.image_selection.as_ref().filter(|s| s.page == placed.page && s.index < images.len())?.index;
+    let image = images.get(index)?;
+    let cropping = session.image_selection.as_ref().is_some_and(|s| s.crop.is_some());
+    let pic = PagePicture { placed, xf: &xf, info, index, image };
+    if cropping { crop_controls(ui, body, session, &pic, &images) } else { box_controls(ui, body, session, doc, &pic) }
+}
+
 fn box_controls(
     ui: &mut egui::Ui,
     body: &PageBody<'_>,

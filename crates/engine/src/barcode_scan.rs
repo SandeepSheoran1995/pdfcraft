@@ -970,11 +970,77 @@ fn fits_scan_budget(w: u32, h: u32, total_scanned_pixels: usize, max_pixels: usi
     (w as usize).checked_mul(h as usize).and_then(|p| total_scanned_pixels.checked_add(p)).filter(|&t| t <= max_pixels)
 }
 
-fn map_embedded_code_to_page(code: &mut ScannedCode, img: &pdfcraft_edit::PageImage, size: (u32, u32), idx: usize, crop: [f32; 4]) -> bool {
-    let (w, h) = size;
-    let code_area = ((code.rect[2] - code.rect[0]) * (code.rect[3] - code.rect[1])).abs();
+fn rect_overlap_ratio(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let ix0 = a[0].max(b[0]);
+    let iy0 = a[1].max(b[1]);
+    let ix1 = a[2].min(b[2]);
+    let iy1 = a[3].min(b[3]);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return 0.0;
+    }
+    let inter = (ix1 - ix0) * (iy1 - iy0);
+    let area_a = ((a[2] - a[0]) * (a[3] - a[1])).max(1e-6);
+    let area_b = ((b[2] - b[0]) * (b[3] - b[1])).max(1e-6);
+    inter / area_a.min(area_b)
+}
+
+fn is_standalone_code_image(w: usize, h: usize, rgba: &[u8], code_rect: [f64; 4], kind: CodeKind) -> bool {
     let img_area = (w as f64) * (h as f64);
-    code.image_index = if img_area > 0.0 && (code_area / img_area) > 0.9 { Some(idx) } else { None };
+    if img_area <= 0.0 {
+        return false;
+    }
+    let cw = (code_rect[2] - code_rect[0]).max(0.0);
+    let ch = (code_rect[3] - code_rect[1]).max(0.0);
+    let ratio = (cw * ch) / img_area;
+    if ratio >= 0.72 {
+        return true;
+    }
+    if ratio < 0.25 {
+        return false;
+    }
+    let margin = 2.0;
+    let ex0 = (code_rect[0] - margin).max(0.0);
+    let ey0 = (code_rect[1] - margin).max(0.0);
+    let ex1 = (code_rect[2] + margin).min(w as f64);
+    let extra_bottom = if kind == CodeKind::QrCode { margin } else { margin + (ch * 0.28).max(16.0) };
+    let ey1 = (code_rect[3] + extra_bottom).min(h as f64);
+
+    let step_x = (w / 48).max(1);
+    let step_y = (h / 48).max(1);
+    let mut outside = 0usize;
+    let mut dark = 0usize;
+    for y in (0..h).step_by(step_y) {
+        let yf = y as f64;
+        for x in (0..w).step_by(step_x) {
+            let xf = x as f64;
+            if xf >= ex0 && xf <= ex1 && yf >= ey0 && yf <= ey1 {
+                continue;
+            }
+            outside += 1;
+            let idx = (y * w + x) * 4;
+            if let Some(&[r, g, b, a]) = rgba.get(idx..idx + 4)
+                && a >= 32
+            {
+                let luma = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+                if luma <= 140 {
+                    dark += 1;
+                }
+            }
+        }
+    }
+    outside == 0 || (dark as f64 / outside as f64) < if kind == CodeKind::QrCode { 0.04 } else { 0.06 }
+}
+
+fn map_embedded_code_to_page(
+    code: &mut ScannedCode,
+    img: &pdfcraft_edit::PageImage,
+    size: (u32, u32),
+    idx: usize,
+    crop: [f32; 4],
+    is_standalone: bool,
+) -> bool {
+    let (w, h) = size;
+    code.image_index = is_standalone.then_some(idx);
 
     let [ma, mb, mc, md, me, mf] = img.matrix;
     let apply = |u: f64, v: f64| -> (f64, f64) { (ma * u + mc * v + me, mb * u + md * v + mf) };
@@ -1058,16 +1124,16 @@ fn is_code_visible_in_render(code: &ScannedCode, info: &pdfcraft_render::PageInf
 fn deduplicate_scanned_codes(scanned: Vec<ScannedCode>) -> Vec<ScannedCode> {
     let mut unique: Vec<ScannedCode> = Vec::new();
     for c in scanned {
-        let is_dup = unique.iter().any(|u| {
-            if u.text == c.text {
-                let overlap_x = (u.rect[0].max(c.rect[0])) <= (u.rect[2].min(c.rect[2]) + 20.0);
-                let overlap_y = (u.rect[1].max(c.rect[1])) <= (u.rect[3].min(c.rect[3]) + 20.0);
-                overlap_x && overlap_y
-            } else {
-                false
+        if let Some(pos) = unique.iter().position(|u| {
+            let overlap_same = u.text == c.text
+                && (u.rect[0].max(c.rect[0])) <= (u.rect[2].min(c.rect[2]) + 20.0)
+                && (u.rect[1].max(c.rect[1])) <= (u.rect[3].min(c.rect[3]) + 20.0);
+            overlap_same || rect_overlap_ratio(u.rect, c.rect) >= 0.55
+        }) {
+            if c.image_index.is_some() || unique[pos].image_index.is_none() {
+                unique[pos] = c;
             }
-        });
-        if !is_dup {
+        } else {
             unique.push(c);
         }
     }
@@ -1128,9 +1194,10 @@ impl Document {
     }
 
     fn scan_embedded_page_images(&self, page: usize, crop: [f32; 4]) -> Vec<ScannedCode> {
-        let mut scanned = Vec::new();
+        type EmbeddedScanEntry = (u32, u32, Vec<(ScannedCode, bool)>);
+        let mut scanned: Vec<ScannedCode> = Vec::new();
         let images = self.page_images(page);
-        let mut cached_image_scans: std::collections::HashMap<String, (u32, u32, Vec<ScannedCode>)> = std::collections::HashMap::new();
+        let mut cached_image_scans: std::collections::HashMap<String, EmbeddedScanEntry> = std::collections::HashMap::new();
         let mut total_scanned_pixels = 0usize;
 
         for (idx, img) in images.iter().enumerate() {
@@ -1141,16 +1208,25 @@ impl Document {
                 let Some((w, h, rgba)) = self.decode_embedded_image_for_scan(page, idx, img, &mut total_scanned_pixels) else {
                     continue;
                 };
-                let codes = scan_rgba_buffer(w as usize, h as usize, &rgba, page);
+                let raw_codes = scan_rgba_buffer(w as usize, h as usize, &rgba, page);
+                let codes: Vec<(ScannedCode, bool)> = raw_codes
+                    .into_iter()
+                    .map(|c| {
+                        let standalone = is_standalone_code_image(w as usize, h as usize, &rgba, c.rect, c.kind);
+                        (c, standalone)
+                    })
+                    .collect();
                 cached_image_scans.insert(cache_key, (w, h, codes.clone()));
                 (w, h, codes)
             } else {
                 continue;
             };
 
-            for mut code in img_codes {
+            for (mut code, is_standalone) in img_codes {
                 code.id = scanned.len();
-                if map_embedded_code_to_page(&mut code, img, (w, h), idx, crop) {
+                if map_embedded_code_to_page(&mut code, img, (w, h), idx, crop, is_standalone) {
+                    // Later image in PDF paint order occludes any earlier image code at the same box.
+                    scanned.retain(|prev| rect_overlap_ratio(prev.rect, code.rect) < 0.55);
                     scanned.push(code);
                 }
             }
@@ -1180,11 +1256,12 @@ impl Document {
                     let same_symbol = c.text == code.text;
                     let overlap_x = (c.rect[0].max(code.rect[0])) <= (c.rect[2].min(code.rect[2]) + 15.0);
                     let overlap_y = (c.rect[1].max(code.rect[1])) <= (c.rect[3].min(code.rect[3]) + 15.0);
-                    let matches = same_symbol && overlap_x && overlap_y;
-                    if matches && c.image_index.is_some() {
+                    let same_box = same_symbol && overlap_x && overlap_y;
+                    let occluded = rect_overlap_ratio(c.rect, code.rect) >= 0.45;
+                    if same_box && c.image_index.is_some() {
                         matched_image_index = c.image_index;
                     }
-                    !matches
+                    !(same_box || occluded)
                 });
                 code.id = scanned.len();
                 code.image_index = matched_image_index;
@@ -1223,6 +1300,57 @@ impl Document {
     /// This strictly enforces the pixel-perfect replacement constraint: the generated PNG byte stream
     /// matches `[width, height]` down to the exact pixel.
     pub fn generate_replacement_code(kind: CodeKind, text: &str, target_width: u32, target_height: u32) -> Result<Vec<u8>, String> {
+        let rgba = Self::generate_code_rgba(kind, text, target_width, target_height)?;
+        encode_png_exact(target_width, target_height, &rgba)
+    }
+
+    /// Generate a replacement code placed at `inner_rect` (`[x0, y0, x1, y1]` in pixels) inside
+    /// an opaque white canvas of `frame_width × frame_height`.
+    ///
+    /// Used when replacing an embedded raster image whose frame includes a surrounding quiet zone,
+    /// so the code keeps its exact original physical size instead of stretching into the margins.
+    pub fn generate_replacement_code_in_frame(
+        kind: CodeKind,
+        text: &str,
+        frame_width: u32,
+        frame_height: u32,
+        inner_rect: [u32; 4],
+    ) -> Result<Vec<u8>, String> {
+        if frame_width == 0 || frame_height == 0 {
+            return Err("Frame dimensions must be non-zero".into());
+        }
+        let total_frame_pixels = (frame_width as usize)
+            .checked_mul(frame_height as usize)
+            .filter(|&p| p <= 16_000_000)
+            .ok_or_else(|| "Frame dimensions exceed maximum raster budget of 16 megapixels".to_string())?;
+        let byte_len = total_frame_pixels.checked_mul(4).ok_or_else(|| "Frame pixel buffer size overflow".to_string())?;
+
+        let [x0, y0, x1, y1] = inner_rect;
+        if x0 >= x1 || y0 >= y1 || x1 > frame_width || y1 > frame_height {
+            return Err(format!("Invalid inner rect {inner_rect:?} for {frame_width}x{frame_height} frame"));
+        }
+        let inner_w = x1 - x0;
+        let inner_h = y1 - y0;
+        let inner_rgba = Self::generate_code_rgba(kind, text, inner_w, inner_h)?;
+
+        let mut frame = vec![255u8; byte_len];
+        let fw = frame_width as usize;
+        let iw = inner_w as usize;
+        let x0u = x0 as usize;
+        let y0u = y0 as usize;
+        for row in 0..(inner_h as usize) {
+            let src_start = row * iw * 4;
+            let src_end = src_start + iw * 4;
+            let dst_start = ((y0u + row) * fw + x0u) * 4;
+            let dst_end = dst_start + iw * 4;
+            if let (Some(src), Some(dst)) = (inner_rgba.get(src_start..src_end), frame.get_mut(dst_start..dst_end)) {
+                dst.copy_from_slice(src);
+            }
+        }
+        encode_png_exact(frame_width, frame_height, &frame)
+    }
+
+    fn generate_code_rgba(kind: CodeKind, text: &str, target_width: u32, target_height: u32) -> Result<Vec<u8>, String> {
         if target_width == 0 || target_height == 0 {
             return Err("Target dimensions must be non-zero".into());
         }
@@ -1304,7 +1432,7 @@ impl Document {
             }
         }
 
-        encode_png_exact(tw as u32, th as u32, &rgba)
+        Ok(rgba)
     }
 }
 
@@ -1334,36 +1462,122 @@ fn probe_finder_radius(gray: &[u8], dims: [usize; 2], center: [isize; 2], dir: [
     None
 }
 
-/// Expand QR finder-pattern center bounds (`[min_x, min_y, max_x, max_y]`) to include the full
-/// outer finder band (3.5 modules).
+fn is_finder_center(gray: &[u8], dims: [usize; 2], pt: &rxing::Point, pad: f32, max_probe: isize) -> Option<f32> {
+    let [width, height] = dims;
+    let cx = (pt.x - pad).round() as isize;
+    let cy = (pt.y - pad).round() as isize;
+    let (Ok(ux), Ok(uy)) = (usize::try_from(cx), usize::try_from(cy)) else { return None };
+    let &center_val = (ux < width && uy < height).then(|| gray.get(uy * width + ux)).flatten()?;
+    if center_val > 150 {
+        return None;
+    }
+    let thresh = center_val.saturating_add(64).min(170);
+    let mut dirs = Vec::with_capacity(4);
+    for &(dx, dy) in &[(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+        if let Some(radius) = probe_finder_radius(gray, dims, [cx, cy], [dx, dy], thresh, max_probe) {
+            dirs.push(radius);
+        }
+    }
+    if dirs.len() < 4 {
+        return None;
+    }
+    dirs.sort_by(|a, b| a.total_cmp(b));
+    let min_r = dirs[0];
+    let max_r = dirs[dirs.len() - 1];
+    (max_r <= min_r * 1.8).then_some(dirs[dirs.len() / 2])
+}
+
+/// Snap outer QR corner bounds (`[min_x, min_y, max_x, max_y]`) within +/-2px to the actual dark
+/// outer boundary of the QR symbol, compensating for `DefaultGridSampler`'s +0.5px offset without
+/// jumping to nearby table borders or text.
+fn snap_qr_outer_bounds(gray: &[u8], dims: [usize; 2], bounds: &mut [f32; 4]) {
+    let [width, height] = dims;
+    if width == 0 || height == 0 || (bounds[2] - bounds[0]) < 10.0 || (bounds[3] - bounds[1]) < 10.0 {
+        return;
+    }
+    let thresh = 160u8;
+    let x_lo = (bounds[0] + 2.0).floor().clamp(0.0, (width - 1) as f32) as usize;
+    let x_hi = (bounds[2] - 2.0).ceil().clamp(0.0, width as f32) as usize;
+    let y_lo = (bounds[1] + 2.0).floor().clamp(0.0, (height - 1) as f32) as usize;
+    let y_hi = (bounds[3] - 2.0).ceil().clamp(0.0, height as f32) as usize;
+    if x_lo >= x_hi || y_lo >= y_hi {
+        return;
+    }
+
+    let col_dark = |x: usize| (y_lo..y_hi).any(|y| gray.get(y * width + x).is_some_and(|&v| v <= thresh));
+    let row_dark = |y: usize| (x_lo..x_hi).any(|x| gray.get(y * width + x).is_some_and(|&v| v <= thresh));
+
+    let left_start = (bounds[0] - 1.5).floor().max(0.0) as usize;
+    let left_end = (bounds[0] + 2.5).ceil().min((x_hi - 1) as f32) as usize;
+    if let Some(lx) = (left_start..=left_end).find(|&x| col_dark(x) && (x == 0 || !col_dark(x - 1))) {
+        bounds[0] = lx as f32;
+    } else if let Some(lx) = (left_start..=left_end).find(|&x| col_dark(x)) {
+        bounds[0] = lx as f32;
+    }
+
+    let right_start = (bounds[2] + 1.5).ceil().min(width as f32) as usize;
+    let right_end = (bounds[2] - 2.5).floor().max((x_lo + 1) as f32) as usize;
+    if let Some(rx) = (right_end..=right_start).rev().find(|&x| x > 0 && col_dark(x - 1) && (x >= width || !col_dark(x))) {
+        bounds[2] = rx as f32;
+    } else if let Some(rx) = (right_end..=right_start).rev().find(|&x| x > 0 && col_dark(x - 1)) {
+        bounds[2] = rx as f32;
+    }
+
+    let top_start = (bounds[1] - 1.5).floor().max(0.0) as usize;
+    let top_end = (bounds[1] + 2.5).ceil().min((y_hi - 1) as f32) as usize;
+    if let Some(ty) = (top_start..=top_end).find(|&y| row_dark(y) && (y == 0 || !row_dark(y - 1))) {
+        bounds[1] = ty as f32;
+    } else if let Some(ty) = (top_start..=top_end).find(|&y| row_dark(y)) {
+        bounds[1] = ty as f32;
+    }
+
+    let bot_start = (bounds[3] + 1.5).ceil().min(height as f32) as usize;
+    let bot_end = (bounds[3] - 2.5).floor().max((y_lo + 1) as f32) as usize;
+    if let Some(by) = (bot_end..=bot_start).rev().find(|&y| y > 0 && row_dark(y - 1) && (y >= height || !row_dark(y))) {
+        bounds[3] = by as f32;
+    } else if let Some(by) = (bot_end..=bot_start).rev().find(|&y| y > 0 && row_dark(y - 1)) {
+        bounds[3] = by as f32;
+    }
+}
+
+/// Refine QR bounds from `rxing`'s `points`.
+///
+/// `rxing`'s C++ port detector returns the 4 outer corners of the QR grid (`[tl, tr, bl, br]`),
+/// whereas the fallback detector returns the 3 finder centers (plus optional alignment center).
+/// Only expand by the finder radius (3.5 modules) when `points` are actually finder centers.
 fn refine_qr_bounds(gray: &[u8], dims: [usize; 2], points: &[rxing::Point], pad: f32, bounds: &mut [f32; 4]) {
     let [width, height] = dims;
     if points.is_empty() || width == 0 || height == 0 {
         return;
     }
 
-    let mut finder_radii = Vec::new();
-    let max_probe = (width.max(height) / 2).max(16) as isize;
-    for pt in points.iter().take(3) {
-        let cx = (pt.x - pad).round() as isize;
-        let cy = (pt.y - pad).round() as isize;
-        let (Ok(ux), Ok(uy)) = (usize::try_from(cx), usize::try_from(cy)) else { continue };
-        let Some(&center_val) = (ux < width && uy < height).then(|| gray.get(uy * width + ux)).flatten() else { continue };
-        let thresh = center_val.saturating_add(64).min(170);
-        for &(dx, dy) in &[(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
-            if let Some(radius) = probe_finder_radius(gray, dims, [cx, cy], [dx, dy], thresh, max_probe) {
-                finder_radii.push(radius);
-            }
-        }
+    let leg = if points.len() >= 3 {
+        let p0 = points[0];
+        let p1 = points[1];
+        let p2 = points[2];
+        let mut dists = [(p0.x - p1.x).hypot(p0.y - p1.y), (p1.x - p2.x).hypot(p1.y - p2.y), (p2.x - p0.x).hypot(p2.y - p0.y)];
+        dists.sort_by(|a, b| a.total_cmp(b));
+        dists[1].max(1.0)
+    } else {
+        (bounds[2] - bounds[0]).max(bounds[3] - bounds[1]).max(1.0)
+    };
+    let max_radius = leg * 0.28;
+    let max_probe = max_radius.ceil().max(4.0) as isize;
+
+    let mut finder_radii: Vec<f32> = points.iter().take(3).filter_map(|pt| is_finder_center(gray, dims, pt, pad, max_probe)).collect();
+
+    // `cpp_port::QrReader` returns 4 outer corners `[tl, tr, bl, br]` (not finder centers).
+    if points.len() >= 4 && finder_radii.len() < 3 {
+        snap_qr_outer_bounds(gray, dims, bounds);
+        return;
     }
 
     let expand = if !finder_radii.is_empty() {
         finder_radii.sort_by(|a, b| a.total_cmp(b));
-        finder_radii[finder_radii.len() / 2]
+        finder_radii[finder_radii.len() / 2].clamp(1.0, max_radius)
     } else {
         // Fallback for Version 1 (21x21): finder centers span 14 modules, outer band is 3.5 modules each side.
-        let span = (bounds[2] - bounds[0]).max(bounds[3] - bounds[1]);
-        (span * (3.5 / 14.0)).max(1.0)
+        (leg * (3.5 / 14.0)).max(1.0)
     };
     bounds[0] = (bounds[0] - expand).clamp(0.0, width as f32);
     bounds[1] = (bounds[1] - expand).clamp(0.0, height as f32);
@@ -1430,9 +1644,76 @@ mod tests {
         assert_eq!(scanned[0].text, payload);
         // For module=6px and quiet=4 modules, the 21x21 QR symbol covers x=24..150, y=24..150 (126x126px),
         // including the outer 3.5-module finder bands outside the finder centers (45..129).
-        assert!(scanned[0].rect[0] <= 26.0 && scanned[0].rect[1] <= 26.0, "expected outer top-left near 24, got {:?}", scanned[0].rect);
-        assert!(scanned[0].rect[2] >= 148.0 && scanned[0].rect[3] >= 148.0, "expected outer bottom-right near 150, got {:?}", scanned[0].rect);
-        assert!(scanned[0].pixel_size[0] >= 122 && scanned[0].pixel_size[1] >= 122, "expected full ~126px size, got {:?}", scanned[0].pixel_size);
+        assert!(
+            (scanned[0].rect[0] - 24.0).abs() <= 2.0 && (scanned[0].rect[1] - 24.0).abs() <= 2.0,
+            "expected outer top-left near 24, got {:?}",
+            scanned[0].rect
+        );
+        assert!(
+            (scanned[0].rect[2] - 150.0).abs() <= 2.0 && (scanned[0].rect[3] - 150.0).abs() <= 2.0,
+            "expected outer bottom-right near 150, got {:?}",
+            scanned[0].rect
+        );
+        assert!(
+            (122..=130).contains(&scanned[0].pixel_size[0]) && (122..=130).contains(&scanned[0].pixel_size[1]),
+            "expected exact ~126px size, got {:?}",
+            scanned[0].pixel_size
+        );
+    }
+
+    #[test]
+    fn test_qr_code_inside_bordered_cell_keeps_exact_bounds() {
+        let payload = "WQ-1313046-4916-2786";
+        let matrix = QrCode::encode_text(payload).expect("encode qr");
+        let module_px = 5usize;
+        let qr_side = matrix.size * module_px;
+        let canvas_w = 400usize;
+        let canvas_h = 400usize;
+        let qr_x0 = (canvas_w - qr_side) / 2;
+        let qr_y0 = (canvas_h - qr_side) / 2;
+
+        let mut rgba = vec![255u8; canvas_w * canvas_h * 4];
+        let mut draw_rect = |x0: usize, y0: usize, x1: usize, y1: usize| {
+            for y in y0.min(canvas_h)..y1.min(canvas_h) {
+                for x in x0.min(canvas_w)..x1.min(canvas_w) {
+                    let idx = (y * canvas_w + x) * 4;
+                    rgba[idx] = 0;
+                    rgba[idx + 1] = 0;
+                    rgba[idx + 2] = 0;
+                }
+            }
+        };
+
+        // Draw table borders surrounding the QR cell with white quiet margin (~20px).
+        let cell_x0 = qr_x0 - 40;
+        let cell_x1 = qr_x0 + qr_side + 40;
+        let cell_y0 = qr_y0 - 20;
+        let cell_y1 = qr_y0 + qr_side + 20;
+        draw_rect(cell_x0, cell_y0, cell_x1, cell_y0 + 2);
+        draw_rect(cell_x0, cell_y1, cell_x1, cell_y1 + 2);
+        draw_rect(cell_x0, cell_y0, cell_x0 + 2, cell_y1 + 2);
+        draw_rect(cell_x1, cell_y0, cell_x1 + 2, cell_y1 + 2);
+
+        for r in 0..matrix.size {
+            for c in 0..matrix.size {
+                if matrix.is_dark(r, c) {
+                    let x0 = qr_x0 + c * module_px;
+                    let y0 = qr_y0 + r * module_px;
+                    draw_rect(x0, y0, x0 + module_px, y0 + module_px);
+                }
+            }
+        }
+
+        let scanned = scan_rgba_buffer(canvas_w, canvas_h, &rgba, 0);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].text, payload);
+        let r = scanned[0].rect;
+        assert!((r[0] - qr_x0 as f64).abs() <= 2.0, "left edge inflated to table border: expected {qr_x0}, got {r:?}");
+        assert!((r[1] - qr_y0 as f64).abs() <= 2.0, "top edge inflated to table border: expected {qr_y0}, got {r:?}");
+        assert!((r[2] - (qr_x0 + qr_side) as f64).abs() <= 2.0, "right edge inflated: expected {}, got {r:?}", qr_x0 + qr_side);
+        assert!((r[3] - (qr_y0 + qr_side) as f64).abs() <= 2.0, "bottom edge inflated: expected {}, got {r:?}", qr_y0 + qr_side);
+        assert!(scanned[0].pixel_size[0].abs_diff(qr_side as u32) <= 3, "expected ~{qr_side}px width, got {:?}", scanned[0].pixel_size);
+        assert!(scanned[0].pixel_size[1].abs_diff(qr_side as u32) <= 3, "expected ~{qr_side}px height, got {:?}", scanned[0].pixel_size);
     }
 
     #[test]

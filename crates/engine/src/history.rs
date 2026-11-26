@@ -104,6 +104,7 @@ pub(crate) fn scope_of(edit: &Edit) -> Scope {
         | Edit::ReplaceImage { .. }
         | Edit::PasteContent { .. }
         | Edit::PasteObjects { .. }
+        | Edit::BakeBarcodeWhiteout { .. }
         | Edit::AddHeaderFooter { .. }
         | Edit::AddWatermark { .. }
         | Edit::AddBackground { .. }

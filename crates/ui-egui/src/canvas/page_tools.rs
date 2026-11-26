@@ -168,8 +168,11 @@ pub(crate) struct PageTool<'a> {
     presenter_keys: Vec<(ToolKey, bool)>,
     /// Select with added content selected (Edit a PDF panel open): Delete removes it.
     content_delete: bool,
+    /// Active selection can be nudged with arrow keys across Select, EditText, or QR/Barcode tools.
+    can_nudge: bool,
     button_held: bool,
     delete_content: bool,
+    nudge: Option<(egui::Vec2, bool)>,
 }
 
 /// What the page tool finished in a pass. The fields the page body reads are public; the rest are applied to the
@@ -200,6 +203,7 @@ pub(crate) struct ToolFinish {
     text_finished: bool,
     /// Delete was pressed with added content selected under Select.
     delete_content: bool,
+    nudge: Option<(egui::Vec2, bool)>,
 }
 
 /// Whether copied comments hang on the pointer: they take the next click whatever tool is on.
@@ -297,6 +301,15 @@ pub(crate) fn page_tool<'a>(
     let map: &'a comments::PageMap<'a> = map_slot.insert(comments::PageMap::new(cx.info, cx.pages, cx.rotation, cx.view));
     let selects_text = tool_selects_text(tool, cx.preparing);
     let content_delete = tool == QuickTool::Select && session.content.selected.is_some() && session.content.draft.is_none();
+    let can_nudge = cx.can_modify
+        && matches!(tool, QuickTool::Select | QuickTool::EditText | QuickTool::QrBarcode)
+        && (session.objects.count() > 0
+            || session.image_selection.is_some()
+            || session.canvas_selection.selected.as_ref().is_some_and(|s| {
+                matches!(s.kind, crate::canvas_selection::SelectableKind::VectorLine | crate::canvas_selection::SelectableKind::Image)
+            })
+            || (session.barcode_hud.open
+                && session.barcode_hud.active_code().is_some_and(|c| crate::barcode_hud::whole_image_index(c, cx.doc).is_some())));
     let arm = match tool {
         // Prepare a form under the Select tool: the selection rectangle and the moves of fields are Prepare's.
         QuickTool::Select if cx.preparing => {
@@ -428,8 +441,10 @@ pub(crate) fn page_tool<'a>(
         presenting: cx.presenting,
         presenter_keys: Vec::new(),
         content_delete,
+        can_nudge,
         button_held: cx.button_held,
         delete_content: false,
+        nudge: None,
     }
 }
 
@@ -480,6 +495,7 @@ impl<'a> PageTool<'a> {
             text_tool: self.selects_text.then_some(self.tool),
             text_finished: self.released && self.selects_text,
             delete_content: self.delete_content,
+            nudge: self.nudge,
             ..ToolFinish::default()
         };
         match self.arm {
@@ -544,6 +560,11 @@ impl ToolFinish {
         }
         if self.delete_content && session.pending_edit.is_none() {
             session.pending_edit = crate::content_ui::delete_selected(session);
+        }
+        if let Some((direction, far)) = self.nudge.take()
+            && session.pending_edit.is_none()
+        {
+            session.pending_edit = crate::tools::object_ui::nudge(session, cx.doc, direction, far, cx.geometry());
         }
         // The first page key of the pass turns the page; the rest wait for the next pass's keys.
         self.turn = self.presenter_keys.drain(..).find_map(|(key, shift)| session.presenter.key(&key, shift));
@@ -655,6 +676,9 @@ impl CanvasTool for PageTool<'_> {
         if self.content_delete {
             claims = claims.deletes();
         }
+        if self.can_nudge {
+            claims = claims.nudges();
+        }
         if self.presenting { claims.keys(presenter::PRESENT_KEYS) } else { claims }
     }
 
@@ -676,6 +700,12 @@ impl CanvasTool for PageTool<'_> {
             return true;
         }
         if self.tool_mut().key(key, cx) {
+            return true;
+        }
+        if self.can_nudge
+            && let ToolKey::Nudge { direction, mods, .. } = key
+        {
+            self.nudge = Some((*direction, mods.shift));
             return true;
         }
         if self.content_delete && matches!(key, ToolKey::Delete { .. }) {

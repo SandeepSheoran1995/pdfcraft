@@ -127,6 +127,7 @@ pub(crate) fn check_permission(edit: &Edit, p: &pdfcraft_cos::Permissions) -> Re
         | Edit::ReplaceImage { .. }
         | Edit::PasteContent { .. }
         | Edit::PasteObjects { .. }
+        | Edit::BakeBarcodeWhiteout { .. }
         | Edit::ClearRedactions
         | Edit::RemoveHidden { .. }
         | Edit::ImportData { .. }
@@ -937,6 +938,7 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
         Edit::MoveObjects { page, objects, offset } => pdfcraft_edit::move_objects(doc, *page, objects, *offset)?,
         Edit::DeleteObjects { page, objects } => crate::object_clip::delete(doc, *page, objects, |doc, edit| run_edit(doc, edit, cx))?,
         Edit::PasteObjects { page, clip, offset } => crate::object_clip::paste(doc, *page, clip, *offset)?,
+        Edit::BakeBarcodeWhiteout { page, rects } => crate::barcode_bake::bake_whiteout(doc, *page, rects)?,
         Edit::UpdateLineEndpoints { page, target, new_start, new_end } => {
             pdfcraft_edit::update_line_endpoints(doc, *page, *target, *new_start, *new_end)?;
         }

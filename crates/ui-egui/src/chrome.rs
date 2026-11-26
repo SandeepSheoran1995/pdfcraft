@@ -131,7 +131,7 @@ fn title_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
         app.reading_bg.picker_focus_pending = false;
     }
 
-    if app.reading_bg.picker_open {
+    if app.reading_bg.picker_open && !ui.is_sizing_pass() {
         let allow_esc = !app.modal_open() && !app.palette_open;
         let reading_bg = &mut app.reading_bg;
         let mut open = reading_bg.picker_open;

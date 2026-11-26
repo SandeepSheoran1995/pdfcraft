@@ -99,8 +99,7 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut Ui) {
         app.reading_bg.toggle_picker(bg_btn.response.id);
         ui.ctx().request_repaint();
     }
-    let tint_btn =
-        IconButton::new(IconId::new("sliders-horizontal")).label(tl!("Eye strain tint settings")).selected(app.reading_bg.picker_open).show(ui);
+    let tint_btn = IconButton::new(IconId::new("adjustments")).label(tl!("Eye strain tint settings")).selected(app.reading_bg.picker_open).show(ui);
     if tint_btn.clicked() {
         app.reading_bg.toggle_picker(tint_btn.response.id);
         ui.ctx().request_repaint();

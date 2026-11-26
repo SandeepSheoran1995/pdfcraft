@@ -585,15 +585,25 @@ pub(crate) fn objects_press(session: &mut PageSession, doc: &Document, _info: &D
     // `info` is the page geometry every press handler takes; the move itself needs none.
 }
 
-/// An arrow key moves the selected objects, else the selected picture, a point (`far`: ten points), as
-/// in Acrobat. `direction` is a unit vector on screen. Nothing while an edit waits to be applied.
+/// An arrow key moves the selected objects, vector line, image, or barcode a point (`far`: ten points),
+/// as in Acrobat. `direction` is a unit vector on screen. Nothing while an edit waits to be applied.
 pub(crate) fn nudge(session: &mut PageSession, doc: &Document, direction: Vec2, far: bool, geo: PageGeometry<'_>) -> Option<Edit> {
     if session.pending_edit.is_some() {
         return None;
     }
-    let image = session.image_selection.as_ref().map(|s| (s.page, s.index));
     let objects = session.objects.page.filter(|_| !session.objects.selected.is_empty());
-    let page = objects.or(image.map(|(page, _)| page))?;
+    let selected_line =
+        session.canvas_selection.selected.as_ref().filter(|s| s.kind == crate::canvas_selection::SelectableKind::VectorLine).map(|s| s.page);
+    let selected_canvas_image =
+        session.canvas_selection.selected.as_ref().filter(|s| s.kind == crate::canvas_selection::SelectableKind::Image).map(|s| (s.page, s.index));
+    let image = session.image_selection.as_ref().map(|s| (s.page, s.index)).or(selected_canvas_image);
+    let barcode_image = session
+        .barcode_hud
+        .open
+        .then(|| session.barcode_hud.active_code().cloned())
+        .flatten()
+        .and_then(|c| crate::barcode_hud::whole_image_index(&c, doc).map(|idx| (c.page, idx)));
+    let page = objects.or(selected_line).or(image.map(|(p, _)| p)).or(barcode_image.map(|(p, _)| p))?;
     let xf = session.page_xform(page, geo)?;
     let step = direction * if far { 10.0 } else { 1.0 };
     // A point on screen, whatever the zoom and the view's rotation: one screen pixel's step in
@@ -609,9 +619,40 @@ pub(crate) fn nudge(session: &mut PageSession, doc: &Document, direction: Vec2, 
     if objects.is_some() {
         return Some(session.objects.move_by(page, offset));
     }
-    let (page, index) = image?;
+    if let Some(sel) = session.canvas_selection.selected.as_mut()
+        && sel.kind == crate::canvas_selection::SelectableKind::VectorLine
+        && sel.page == page
+    {
+        let page_lines = session.vector_lines.get(&page).map_or(&[][..], |(_, lines)| lines.as_slice());
+        return crate::canvas_selection::move_selected_line_by(page, sel, page_lines, session.extend_perpendicular_lines, offset);
+    }
+    let (img_page, index) = image.or(barcode_image)?;
+    if img_page != page {
+        return None;
+    }
     let r = doc.page_images(page).get(index).map(|im| im.rect)?;
     let rect = [r[0] + offset[0], r[1] + offset[1], r[2] + offset[0], r[3] + offset[1]];
+    if let Some(sel) = session.canvas_selection.selected.as_mut()
+        && sel.kind == crate::canvas_selection::SelectableKind::Image
+        && sel.page == page
+        && sel.index == index
+    {
+        sel.user_rect = rect;
+    }
+    if session.barcode_hud.open
+        && let Some(active) = session.barcode_hud.active_code().cloned()
+        && active.page == page
+        && (active.image_index == Some(index) || crate::barcode_hud::whole_image_index(&active, doc) == Some(index))
+    {
+        let code_rect = [active.rect[0] + offset[0], active.rect[1] + offset[1], active.rect[2] + offset[0], active.rect[3] + offset[1]];
+        session.barcode_hud.target_rect = Some(code_rect);
+        session.barcode_hud.select_embedded_image = session.image_selection.as_ref().is_some_and(|s| s.page == page && s.index == index);
+        session.barcode_hud.page_codes.remove(&page);
+        session.barcode_hud.last_scanned_page = None;
+        if let Some(active_mut) = session.barcode_hud.scanned_codes.get_mut(session.barcode_hud.active_index) {
+            active_mut.rect = code_rect;
+        }
+    }
     Some(Edit::EditPageImage { page, index, change: pdfcraft_engine::ImageEdit::Move(rect) })
 }
 

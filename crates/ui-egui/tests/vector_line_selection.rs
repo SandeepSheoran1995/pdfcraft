@@ -53,3 +53,32 @@ fn hit_test_line_endpoint_finds_start_and_end() {
     let hit_miss = hit_test_line_endpoint(&line, pos2(0.0, 0.0), &xf, &info, 8.0);
     assert_eq!(hit_miss, None);
 }
+
+#[test]
+fn move_selected_line_by_translates_endpoints_and_preserves_midpoint_hit() {
+    use pdfcraft_engine::Edit;
+    use pdfcraft_ui_egui::canvas_selection::{SelectableElement, hit_test_line, move_selected_line_by};
+
+    let page_info = PageInfo { width: 612.0, height: 792.0, label: "1".into(), crop: [0.0, 0.0, 612.0, 792.0], rotation: 0 };
+    let info = DocInfo { pages: vec![page_info], ..Default::default() };
+    let xf = PageXform { rect: Rect::from_min_size(Pos2::ZERO, vec2(612.0, 792.0)), rot: 0, pw: 612.0, ph: 792.0 };
+    let line = LineSegment { page: 0, index: 3, start: [100.0, 200.0], end: [300.0, 200.0], thickness: 1.0, stroke_color: None, rect_op: None };
+
+    // Midpoint on screen (200, 592) hits the line body, not either endpoint.
+    assert!(hit_test_line(pos2(200.0, 592.0), &line, &xf, &info, 8.0));
+    assert_eq!(hit_test_line_endpoint(&line, pos2(200.0, 592.0), &xf, &info, 8.0), None);
+
+    let mut sel = SelectableElement::new_line_vector(0, line.clone());
+    let edit = move_selected_line_by(0, &mut sel, std::slice::from_ref(&line), false, [15.0, -25.0]).expect("line edit");
+    match edit {
+        Edit::UpdateLineEndpoints { page, new_start, new_end, .. } => {
+            assert_eq!(page, 0);
+            assert_eq!(new_start, [115.0, 175.0]);
+            assert_eq!(new_end, [315.0, 175.0]);
+        }
+        other => panic!("unexpected edit: {other:?}"),
+    }
+    let updated = sel.line.as_ref().unwrap();
+    assert_eq!(updated.start, [115.0, 175.0]);
+    assert_eq!(updated.end, [315.0, 175.0]);
+}

@@ -326,6 +326,21 @@ impl Document {
         self.editor.as_ref().and_then(|e| pdfcraft_edit::page_images(&e.cos, page).ok()).unwrap_or_default()
     }
 
+    /// User-space rectangles of any unbaked QR/barcode whiteout overlay images on `page`.
+    pub fn page_whiteout_rects(&self, page: usize) -> Vec<[f64; 4]> {
+        crate::barcode_bake::page_whiteout_rects(self, page)
+    }
+
+    /// High-resolution RGBA crop of `rect` (user space) on `page`.
+    pub fn capture_region_rgba(&self, page: usize, rect: [f64; 4]) -> Result<(u32, u32, Vec<u8>), String> {
+        crate::barcode_bake::capture_region_rgba(self, page, rect)
+    }
+
+    /// High-resolution PNG crop of `rect` (user space) on `page`.
+    pub fn capture_region_png(&self, page: usize, rect: [f64; 4]) -> Result<Vec<u8>, String> {
+        crate::barcode_bake::capture_region_png(self, page, rect)
+    }
+
     /// Mixed editable objects on one page. Source inventories are zero-based and added items
     /// appear once. Rectangles are user-space points, independent of the viewer's zoom.
     pub fn editable_objects(&self, page: usize) -> Result<Vec<EditableObject>, String> {

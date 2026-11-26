@@ -75,6 +75,14 @@ pub struct BarcodeHudState {
     pub reembed_kind: Option<pdfcraft_engine::barcode_scan::CodeKind>,
     /// Selected symbology when generating a new code.
     pub generate_kind: pdfcraft_engine::barcode_scan::CodeKind,
+    /// Requested width in PDF points when generating a new code (also square side for QR codes).
+    pub generate_width_pt: String,
+    /// Requested height in PDF points when generating a new 1D barcode.
+    pub generate_height_pt: String,
+    /// Tracks whether the size inputs were initialized for QR vs 1D barcode defaults.
+    pub generate_size_is_qr: Option<bool>,
+    /// Request selecting the newly placed/replaced code as an interactive image object after rescan.
+    pub select_embedded_image: bool,
     /// Feedback banner timestamp: `(message, expiry_time)`.
     pub toast: Option<(String, f64)>,
     /// Text or URL payload for generating a new QR code.
@@ -270,11 +278,11 @@ fn safe_rect_and_pixels(
         [min_x, min_y, max_x, max_y]
     };
 
-    // Inflate whiteout_rect by 3 PDF points on all sides to completely cover anti-aliased edges
-    let min_x = (min_x - 3.0).max(0.0);
-    let max_x = max_x + 3.0;
-    let min_y = (min_y - 3.0).max(0.0);
-    let max_y = max_y + 3.0;
+    // Inflate whiteout_rect by 1.5 PDF points on all sides to cover anti-aliased edges without clipping nearby borders
+    let min_x = (min_x - 1.5).max(0.0);
+    let max_x = max_x + 1.5;
+    let min_y = (min_y - 1.5).max(0.0);
+    let max_y = max_y + 1.5;
     let whiteout_rect = [min_x, min_y, max_x, max_y];
 
     let (pw, ph) = if kind == pdfcraft_engine::barcode_scan::CodeKind::QrCode {
@@ -289,7 +297,7 @@ fn safe_rect_and_pixels(
 
 /// A scanned user-space rectangle in the display page's space, which `Edit::AddImage` uses.
 /// The CropBox origin and `/Rotate` move the display page away from user space.
-fn display_rect(rect: [f64; 4], page: Option<&DocInfo>, page_index: usize) -> [f64; 4] {
+pub(crate) fn display_rect(rect: [f64; 4], page: Option<&DocInfo>, page_index: usize) -> [f64; 4] {
     let Some(page) = page.and_then(|info| info.pages.get(page_index)) else { return rect };
     let corners = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]].map(|[x, y]| {
         let [vx, vy] = page.user_to_view(x as f32, y as f32);
@@ -334,10 +342,10 @@ fn render_floating_menu(
         let max_x = (viewport.right() - 150.0).max(min_x);
         let menu_pos = pos2(
             (code_rect.center().x - 70.0).clamp(min_x, max_x),
-            if code_rect.bottom() + 38.0 <= viewport.bottom() {
-                code_rect.bottom() + 4.0
+            if code_rect.bottom() + 44.0 <= viewport.bottom() {
+                code_rect.bottom() + 10.0
             } else {
-                (code_rect.top() - 34.0).max(viewport.top() + 10.0)
+                (code_rect.top() - 40.0).max(viewport.top() + 10.0)
             },
         );
         let palette = HudPalette::from_ui(ui);
@@ -357,6 +365,7 @@ fn render_floating_menu(
                             if can_modify
                                 && clicked(
                                     &Button::new(tl!("Delete"))
+                                        .id_salt("delete")
                                         .icon(IconId::new("trash-2"))
                                         .variant(Variant::GHOST)
                                         .tooltip(tl!("Delete barcode and whiteout region"))
@@ -367,6 +376,7 @@ fn render_floating_menu(
                             }
                             if clicked(
                                 &Button::new(tl!("Download"))
+                                    .id_salt("download")
                                     .icon(IconId::new("file-down"))
                                     .variant(Variant::GHOST)
                                     .tooltip(tl!("Export barcode PNG to Downloads folder"))
@@ -515,6 +525,7 @@ impl BarcodeScannerHud {
         view.session.barcode_hud.update_codes_conditional(codes, open);
         view.session.barcode_hud.panel_open = panel_open;
         if open {
+            view.session.barcode_hud.select_embedded_image = true;
             let msg = if count > 0 {
                 let template =
                     crate::i18n::trn(crate::i18n::current(), count as u64, "Detected {n} code on page {page}", "Detected {n} codes on page {page}");
@@ -530,7 +541,7 @@ impl BarcodeScannerHud {
     ///
     /// Returns a pending replacement `Edit` if the user modified and applied a code.
     pub fn show(ui: &mut egui::Ui, view: &mut DocView, doc: &Document, info: &DocInfo, can_modify: bool) -> Option<Edit> {
-        if !view.session.barcode_hud.open || !view.session.barcode_hud.panel_open {
+        if ui.is_sizing_pass() || !view.session.barcode_hud.open || !view.session.barcode_hud.panel_open {
             return None;
         }
 
@@ -542,10 +553,16 @@ impl BarcodeScannerHud {
         let now = ui.input(|i| i.time);
         let page_xf = view.page_xform(current_page);
 
+        let has_movable_selection =
+            view.session.image_selection.is_some() || view.session.canvas_selection.selected.is_some() || view.session.objects.count() > 0;
         let state = &mut view.session.barcode_hud;
         let mut actions = HudActions::default();
 
-        if state.edit_buffer.is_none() && !ui.ctx().egui_wants_keyboard_input() {
+        if state.edit_buffer.is_none()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !has_movable_selection
+            && !(can_modify && state.active_code().is_some())
+        {
             actions.step_prev = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
             actions.step_next = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
         }
@@ -556,9 +573,21 @@ impl BarcodeScannerHud {
             actions.delete_code = menu_delete;
         }
 
+        let hud_page = state.active_code().map_or(view_page, |c| c.page);
+        let whiteout_rects = if can_modify { doc.page_whiteout_rects(hud_page) } else { Vec::new() };
+
         if state.panel_open {
             let palette = HudPalette::from_ui(ui);
-            let render_cx = HudRenderCx { view_id, viewport, current_page, total_pages, can_modify, palette: &palette, now };
+            let render_cx = HudRenderCx {
+                view_id,
+                viewport,
+                current_page,
+                total_pages,
+                can_modify,
+                has_whiteouts: !whiteout_rects.is_empty(),
+                palette: &palette,
+                now,
+            };
             render_hud_window(ui, state, &render_cx, &mut actions);
         }
 
@@ -581,6 +610,16 @@ impl BarcodeScannerHud {
         }
 
         let mut pending_edit = actions.apply_code.and_then(|(active, buf, kind)| apply_code_replacement(state, doc, info, active, buf, kind, now));
+        if actions.bake_whiteout && !whiteout_rects.is_empty() {
+            state.target_rect = state.active_code().map(|c| c.rect);
+            state.select_embedded_image = true;
+            state.page_codes.remove(&hud_page);
+            state.last_scanned_page = None;
+            state.edit_buffer = None;
+            state.reembed_kind = None;
+            state.show_toast(tl!("White layer baked and original vector graphics removed!").to_string(), now);
+            pending_edit = Some(Edit::BakeBarcodeWhiteout { page: hud_page, rects: whiteout_rects });
+        }
         if let Some(active) = actions.delete_code {
             let target_page = active.page;
             if let Some(edit) = handle_barcode_delete(state, active, target_page, doc, info, now) {
@@ -596,9 +635,11 @@ impl BarcodeScannerHud {
         }
         if actions.step_prev {
             state.prev_code();
+            state.select_embedded_image = true;
         }
         if actions.step_next {
             state.next_code();
+            state.select_embedded_image = true;
         }
         if actions.close_hud {
             state.panel_open = false;
@@ -629,6 +670,7 @@ struct HudActions {
     apply_code: Option<(ScannedCode, String, CodeKind)>,
     cancel_edit: bool,
     delete_code: Option<ScannedCode>,
+    bake_whiteout: bool,
     trigger_generate: bool,
 }
 
@@ -638,6 +680,7 @@ struct HudRenderCx<'a> {
     current_page: usize,
     total_pages: usize,
     can_modify: bool,
+    has_whiteouts: bool,
     palette: &'a HudPalette,
     now: f64,
 }
@@ -669,6 +712,18 @@ fn render_hud_window(ui: &mut egui::Ui, state: &mut BarcodeHudState, cx: &HudRen
                     if let Some(active) = state.active_code().cloned() {
                         ui.add_space(8.0);
                         render_active_code_card(ui, state, &active, cx.can_modify, cx.palette, actions);
+                    }
+                    if cx.can_modify && cx.has_whiteouts {
+                        ui.add_space(6.0);
+                        if clicked(
+                            &Button::new(tl!("Bake White Layer (Remove Vector)"))
+                                .icon(IconId::new("check"))
+                                .variant(Variant::SECONDARY)
+                                .tooltip(tl!("Bake whiteout overlay into page content and permanently remove underlying vector graphics"))
+                                .show(ui),
+                        ) {
+                            actions.bake_whiteout = true;
+                        }
                     }
                     ui.add_space(8.0);
                     ui.separator();
@@ -721,7 +776,7 @@ fn render_page_tracker(
             ui.add_space(6.0);
             if total_codes > 0 {
                 ui.horizontal(|ui| {
-                    if IconButton::new(IconId::new("chevron-left")).label(tl!("Previous barcode or QR code")).show(ui).clicked() {
+                    if IconButton::new(IconId::new("chevron_left")).label(tl!("Previous barcode or QR code")).show(ui).clicked() {
                         actions.step_prev = true;
                     }
                     let count_label =
@@ -729,7 +784,7 @@ fn render_page_tracker(
                     ui.add_space(6.0);
                     ui.colored_label(palette.accent, count_label);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if IconButton::new(IconId::new("chevron-right")).label(tl!("Next barcode or QR code")).show(ui).clicked() {
+                        if IconButton::new(IconId::new("chevron_right")).label(tl!("Next barcode or QR code")).show(ui).clicked() {
                             actions.step_next = true;
                         }
                     });
@@ -759,13 +814,29 @@ fn render_active_code_card(
                 ui.painter().circle_filled(dot_r.center(), 3.0, palette.accent);
                 Text::new(tl!(active.kind.label())).role(TypeRole::Label).show(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pt_w = (active.rect[2] - active.rect[0]).abs();
+                    let pt_h = (active.rect[3] - active.rect[1]).abs();
                     let dims = crate::i18n::fmt(
-                        tl!("{w}×{h}px • 100%"),
-                        &[("w", &active.pixel_size[0].to_string()), ("h", &active.pixel_size[1].to_string())],
+                        tl!("{pw}×{ph} pt • {w}×{h}px"),
+                        &[
+                            ("pw", &format!("{pt_w:.1}")),
+                            ("ph", &format!("{pt_h:.1}")),
+                            ("w", &active.pixel_size[0].to_string()),
+                            ("h", &active.pixel_size[1].to_string()),
+                        ],
                     );
                     Text::new(dims).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
                 });
             });
+            let pt_w = (active.rect[2] - active.rect[0]).abs();
+            let pt_h = (active.rect[3] - active.rect[1]).abs();
+            let mm_w = pt_w * (25.4 / 72.0);
+            let mm_h = pt_h * (25.4 / 72.0);
+            let phys = crate::i18n::fmt(
+                tl!("Size: {w} × {h} pt ({mw} × {mh} mm)"),
+                &[("w", &format!("{pt_w:.1}")), ("h", &format!("{pt_h:.1}")), ("mw", &format!("{mm_w:.1}")), ("mh", &format!("{mm_h:.1}"))],
+            );
+            Text::new(phys).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
             ui.add_space(6.0);
             if let Some(buf) = &mut state.edit_buffer {
                 Text::new(tl!("Edit payload and symbology")).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
@@ -845,6 +916,37 @@ fn render_active_code_card(
         });
 }
 
+fn sync_generate_size_defaults(state: &mut BarcodeHudState) {
+    let is_qr = state.generate_kind == CodeKind::QrCode;
+    if state.generate_size_is_qr != Some(is_qr) || state.generate_width_pt.trim().is_empty() || state.generate_height_pt.trim().is_empty() {
+        if is_qr {
+            state.generate_width_pt = "144".into();
+            state.generate_height_pt = "144".into();
+        } else {
+            state.generate_width_pt = "216".into();
+            state.generate_height_pt = "72".into();
+        }
+        state.generate_size_is_qr = Some(is_qr);
+    }
+}
+
+fn parse_generate_size_pt(state: &BarcodeHudState) -> Result<(f64, f64), String> {
+    let parse_dim = |raw: &str, name: &str| -> Result<f64, String> {
+        let v: f64 = raw.trim().parse().map_err(|_| crate::i18n::fmt(tl!("Invalid {dim} size (use 18–2000 pt)"), &[("dim", name)]))?;
+        if !v.is_finite() || !(18.0..=2000.0).contains(&v) {
+            return Err(crate::i18n::fmt(tl!("{dim} size must be between 18 and 2000 pt"), &[("dim", name)]));
+        }
+        Ok(v)
+    };
+    let w = parse_dim(&state.generate_width_pt, tl!("width"))?;
+    if state.generate_kind == CodeKind::QrCode {
+        Ok((w, w))
+    } else {
+        let h = parse_dim(&state.generate_height_pt, tl!("height"))?;
+        Ok((w, h))
+    }
+}
+
 fn render_generate_section(
     ui: &mut egui::Ui,
     state: &mut BarcodeHudState,
@@ -853,6 +955,7 @@ fn render_generate_section(
     now: f64,
     actions: &mut HudActions,
 ) {
+    sync_generate_size_defaults(state);
     Text::new(tl!("Generate & embed code on page")).role(TypeRole::Label).show(ui);
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
@@ -861,6 +964,7 @@ fn render_generate_section(
         ui.selectable_value(&mut state.generate_kind, CodeKind::Code39, tl!("Code 39"));
         ui.selectable_value(&mut state.generate_kind, CodeKind::Ean13, tl!("EAN-13"));
     });
+    sync_generate_size_defaults(state);
     ui.add_space(4.0);
     let hint = match state.generate_kind {
         CodeKind::QrCode => tl!("QR payload (URL, text)…"),
@@ -870,6 +974,25 @@ fn render_generate_section(
         _ => tl!("Enter code payload…"),
     };
     ui.add(egui::TextEdit::multiline(&mut state.qr_input).desired_width(ui.available_width()).desired_rows(2).hint_text(hint));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if state.generate_kind == CodeKind::QrCode {
+            Text::new(tl!("Size (pt):")).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
+            let resp = ui.add(egui::TextEdit::singleline(&mut state.generate_width_pt).desired_width(58.0));
+            if resp.changed() {
+                state.generate_height_pt = state.generate_width_pt.clone();
+            }
+            if let Ok((side, _)) = parse_generate_size_pt(state) {
+                let mm = side * (25.4 / 72.0);
+                Text::new(format!("({mm:.1} mm)")).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
+            }
+        } else {
+            Text::new(tl!("Size (pt):")).role(TypeRole::Caption).shade(Shade::Muted).show(ui);
+            ui.add(egui::TextEdit::singleline(&mut state.generate_width_pt).desired_width(50.0));
+            Text::new("×").role(TypeRole::Caption).shade(Shade::Muted).show(ui);
+            ui.add(egui::TextEdit::singleline(&mut state.generate_height_pt).desired_width(50.0));
+        }
+    });
     ui.add_space(6.0);
     let can_gen = can_modify && !state.qr_input.trim().is_empty();
     let btn_label = match state.generate_kind {
@@ -900,16 +1023,65 @@ fn apply_code_replacement(
     let (whiteout_rect, new_image_rect, pw, ph) = safe_rect_and_pixels(active.rect, active.pixel_size, kind, Some(&active.text), Some(&buf));
     let (edit_whiteout, edit_image) = (display_rect(whiteout_rect, Some(info), target_page), display_rect(new_image_rect, Some(info), target_page));
 
-    match Document::generate_replacement_code(kind, &buf, pw, ph) {
+    let whole_image_idx = active.image_index.filter(|i| doc.page_images(target_page).get(*i).is_some_and(|im| code_is_whole_image(&active, im.rect)));
+    let whole_image_rect = whole_image_idx.and_then(|i| doc.page_images(target_page).get(i).map(|im| im.rect));
+    let upright_page = info.pages.get(target_page).is_none_or(|p| p.rotation.is_multiple_of(360));
+
+    let area = |r: [f64; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let image_replacement = whole_image_rect.and_then(|im_rect| {
+        let fits_inside = new_image_rect[0] >= im_rect[0] - 1.5
+            && new_image_rect[1] >= im_rect[1] - 1.5
+            && new_image_rect[2] <= im_rect[2] + 1.5
+            && new_image_rect[3] <= im_rect[3] + 1.5;
+        let area_ratio = area(new_image_rect) / area(im_rect).max(1e-6);
+        if fits_inside && area_ratio < 0.92 && upright_page {
+            let iw = (im_rect[2] - im_rect[0]).max(1.0);
+            let ih = (im_rect[3] - im_rect[1]).max(1.0);
+            let cw = (new_image_rect[2] - new_image_rect[0]).max(1.0);
+            let ch = (new_image_rect[3] - new_image_rect[1]).max(1.0);
+            let frame_w = ((iw * f64::from(pw) / cw).round().clamp(f64::from(pw), 4096.0)) as u32;
+            let frame_h = ((ih * f64::from(ph) / ch).round().clamp(f64::from(ph), 4096.0)) as u32;
+            let inner_w = pw.min(frame_w);
+            let inner_h = ph.min(frame_h);
+            let x0 = (((new_image_rect[0] - im_rect[0]).max(0.0) / iw) * f64::from(frame_w)).round().min(f64::from(frame_w - inner_w)) as u32;
+            let y0 = (((im_rect[3] - new_image_rect[3]).max(0.0) / ih) * f64::from(frame_h)).round().min(f64::from(frame_h - inner_h)) as u32;
+            Some((false, Document::generate_replacement_code_in_frame(kind, &buf, frame_w, frame_h, [x0, y0, x0 + inner_w, y0 + inner_h])))
+        } else if !fits_inside || area_ratio < 0.92 {
+            // Code expanded past the old image bounds (e.g. wider 1D barcode) or sits on a rotated
+            // page with quiet-zone padding: resize the image bounds to exact `new_image_rect`.
+            Some((true, Document::generate_replacement_code(kind, &buf, pw, ph)))
+        } else {
+            None
+        }
+    });
+
+    let (resize_whole_image, code_result) = match image_replacement {
+        Some((resize, res)) => (resize, res),
+        None => (false, Document::generate_replacement_code(kind, &buf, pw, ph)),
+    };
+
+    match code_result {
         Ok(png_bytes) => {
-            let whole_image_idx =
-                active.image_index.filter(|i| doc.page_images(target_page).get(*i).is_some_and(|im| code_is_whole_image(&active, im.rect)));
             let pending = if let Some(image_idx) = whole_image_idx {
                 // Replace the embedded raster image directly so no old payload remains underneath.
-                Edit::EditPageImage {
-                    page: target_page,
-                    index: image_idx,
-                    change: pdfcraft_engine::ImageEdit::Replace { name: "UpdatedCode.png".into(), bytes: Arc::new(png_bytes) },
+                if resize_whole_image {
+                    Edit::Batch {
+                        label: "Replace code".into(),
+                        edits: vec![
+                            Edit::EditPageImage { page: target_page, index: image_idx, change: pdfcraft_engine::ImageEdit::Move(new_image_rect) },
+                            Edit::EditPageImage {
+                                page: target_page,
+                                index: image_idx,
+                                change: pdfcraft_engine::ImageEdit::Replace { name: "UpdatedCode.png".into(), bytes: Arc::new(png_bytes) },
+                            },
+                        ],
+                    }
+                } else {
+                    Edit::EditPageImage {
+                        page: target_page,
+                        index: image_idx,
+                        change: pdfcraft_engine::ImageEdit::Replace { name: "UpdatedCode.png".into(), bytes: Arc::new(png_bytes) },
+                    }
                 }
             } else {
                 let whiteout_bytes = Document::generate_whiteout(pw, ph).unwrap_or_default();
@@ -924,6 +1096,7 @@ fn apply_code_replacement(
                 Edit::Batch { label: "Replace code".into(), edits }
             };
             state.target_rect = Some(new_image_rect);
+            state.select_embedded_image = true;
             state.page_codes.remove(&target_page);
             state.last_scanned_page = None;
             state.edit_buffer = None;
@@ -942,15 +1115,25 @@ fn apply_code_replacement(
 fn generate_new_code(state: &mut BarcodeHudState, info: &DocInfo, target_page: usize, now: f64) -> Option<Edit> {
     let text = state.qr_input.trim();
     let kind = state.generate_kind;
-    let (pw, ph, rect_w, rect_h) = match kind {
-        CodeKind::QrCode => (240, 240, 144.0, 144.0),
-        _ => (360, 120, 216.0, 72.0),
+    let (rect_w, rect_h) = match parse_generate_size_pt(state) {
+        Ok(dims) => dims,
+        Err(msg) => {
+            state.show_toast(msg, now);
+            return None;
+        }
+    };
+    let (pw, ph) = match kind {
+        CodeKind::QrCode => {
+            let side = (rect_w * 3.0).round().clamp(120.0, 2048.0) as u32;
+            (side, side)
+        }
+        _ => ((rect_w * 2.0).round().clamp(160.0, 2048.0) as u32, (rect_h * 2.0).round().clamp(48.0, 1024.0) as u32),
     };
     match Document::generate_replacement_code(kind, text, pw, ph) {
         Ok(png_bytes) => {
             let (page_w, page_h) = info.pages.get(target_page).map(|p| (p.width as f64, p.height as f64)).unwrap_or((612.0, 792.0));
-            let x = (page_w - rect_w) * 0.5;
-            let y = (page_h - rect_h) * 0.5;
+            let x = ((page_w - rect_w) * 0.5).max(0.0);
+            let y = ((page_h - rect_h) * 0.5).max(0.0);
             let rect = [x, y, x + rect_w, y + rect_h];
             let filename = match kind {
                 CodeKind::QrCode => "QRCode.png",
@@ -959,6 +1142,8 @@ fn generate_new_code(state: &mut BarcodeHudState, info: &DocInfo, target_page: u
                 CodeKind::Ean13 => "EAN13.png",
                 _ => "Barcode.png",
             };
+            state.target_rect = Some(rect);
+            state.select_embedded_image = true;
             state.page_codes.remove(&target_page);
             state.last_scanned_page = None;
             state.show_toast(crate::i18n::fmt(tl!("{kind} placed on page!"), &[("kind", tl!(kind.label()))]), now);
@@ -971,9 +1156,24 @@ fn generate_new_code(state: &mut BarcodeHudState, info: &DocInfo, target_page: u
     }
 }
 
+/// Returns the `PageImage` index if `code` corresponds to an entire standalone image on its page.
+pub fn whole_image_index(code: &ScannedCode, doc: &Document) -> Option<usize> {
+    code.image_index.filter(|i| doc.page_images(code.page).get(*i).is_some_and(|im| code_is_whole_image(code, im.rect)))
+}
+
 fn code_is_whole_image(code: &ScannedCode, img_rect: [f64; 4]) -> bool {
-    let area = |r: [f64; 4]| ((r[2] - r[0]) * (r[3] - r[1])).abs();
-    area(img_rect) > 0.0 && area(code.rect) / area(img_rect) > 0.9
+    let area = |r: [f64; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let img_area = area(img_rect);
+    let code_area = area(code.rect);
+    if img_area <= 0.0 || code_area <= 0.0 {
+        return false;
+    }
+    let ix0 = code.rect[0].max(img_rect[0]);
+    let iy0 = code.rect[1].max(img_rect[1]);
+    let ix1 = code.rect[2].min(img_rect[2]);
+    let iy1 = code.rect[3].min(img_rect[3]);
+    let inter = (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0);
+    (inter / code_area) > 0.7 && (code_area / img_area) >= 0.25
 }
 
 fn handle_barcode_delete(

@@ -111,6 +111,9 @@ impl SymbolPalette {
     }
 
     pub fn show(ui: &mut egui::Ui, anchor: Pos2) -> Option<&'static str> {
+        if ui.is_sizing_pass() {
+            return None;
+        }
         let env = Env::of(ui);
         let to_c32 = |c: [u8; 4]| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
         let card = to_c32(env.tokens.color.surface.raised.0);

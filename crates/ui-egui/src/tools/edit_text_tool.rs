@@ -50,7 +50,12 @@ impl<'a> EditTextTool<'a> {
 
     /// Something is selected that an arrow moves or Delete removes.
     fn has_selection(&self) -> bool {
-        self.session.objects.count() > 0 || self.session.image_selection.is_some() || self.session.content.selected.is_some()
+        self.session.objects.count() > 0
+            || self.session.image_selection.is_some()
+            || self.session.content.selected.is_some()
+            || self.session.canvas_selection.selected.is_some()
+            || (self.session.barcode_hud.open
+                && self.session.barcode_hud.active_code().is_some_and(|c| crate::barcode_hud::whole_image_index(c, self.doc).is_some()))
     }
 
     /// Queue `edit` for the app to apply, when there is one.

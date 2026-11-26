@@ -600,6 +600,8 @@ pub struct PageSession {
     pub reflow_paragraphs: bool,
     /// Barcode and QR code scanner HUD state.
     pub barcode_hud: crate::barcode_hud::BarcodeHudState,
+    /// Transient preview while dragging or resizing a vector barcode/QR code on canvas.
+    pub(crate) vector_code_drag: Option<crate::edit_text_ui::VectorBarcodeDrag>,
     /// A page scan running on a worker thread: `(document id, page, edit generation, result)`.
     pub(crate) barcode_scan: Option<(u64, usize, u64, std::sync::mpsc::Receiver<Vec<pdfcraft_engine::barcode_scan::ScannedCode>>)>,
     pub(crate) signature_drag: crate::signature_drag::SignatureDrag,
@@ -682,6 +684,7 @@ impl PageSession {
             pending_dash_idx: None,
             reflow_paragraphs: false,
             barcode_hud: Default::default(),
+            vector_code_drag: None,
             barcode_scan: None,
             signature_drag: Default::default(),
             box_drag: PageBoxDrag::default(),
@@ -1743,6 +1746,17 @@ fn page_body(ui: &mut egui::Ui, body: &PageBody<'_>, callbacks: &mut PageCallbac
         if body.pass.is_some() {
             out.back_to_select |= session.content.take_done();
         }
+    } else if cx.can_modify && (cx.tool == QuickTool::QrBarcode || session.barcode_hud.open) {
+        let geo = cx.geometry(body);
+        if session.image_selection.is_some() {
+            if let Some(edit) = crate::edit_text_ui::active_picture_controls(ui, body, session, cx.doc, cx.info, geo) {
+                session.pending_edit = Some(edit);
+            }
+        } else if let Some(edit) = crate::edit_text_ui::vector_barcode_controls(ui, body, session, cx.doc, cx.info, geo) {
+            session.pending_edit = Some(edit);
+        }
+    } else {
+        session.vector_code_drag = None;
     }
     // The focused field's editor, and the Fill & Sign text being typed, over their pages.
     if let Some(editor) = crate::forms_ui::editor::show(ui, body, session, cx.doc, cx.form, cx.info, cx.today, cx.geometry(body))
@@ -2028,7 +2042,30 @@ fn handle_symbol_palette_and_hud(ui: &mut egui::Ui, view: &mut DocView, cx: &Sym
     let scan_active = view.session.barcode_hud.open || view.session.barcode_hud.panel_open || cx.tool == QuickTool::QrBarcode;
     crate::barcode_hud::BarcodeScannerHud::auto_scan_on_page_change(view, cx.doc, now, scan_active, Some(ui.ctx()), cx.visible_pages);
 
+    if view.session.barcode_hud.select_embedded_image
+        && view.session.barcode_scan.is_none()
+        && view.session.barcode_hud.codes_for_page(view.view.current).is_some()
+        && view.session.barcode_hud.cache_generation == Some(cx.doc.edit_generation())
+    {
+        view.session.barcode_hud.select_embedded_image = false;
+        if cx.can_modify {
+            view.session.image_selection = view
+                .session
+                .barcode_hud
+                .active_code()
+                .and_then(|c| crate::barcode_hud::whole_image_index(c, cx.doc).map(|idx| (c.page, idx)))
+                .map(|(page, idx)| crate::edit_text_ui::ImageSelection::at(page, idx));
+        }
+    }
+
     if let Some(hud_edit) = crate::barcode_hud::BarcodeScannerHud::show(ui, view, cx.doc, cx.info, cx.can_modify) {
+        if matches!(
+            hud_edit,
+            pdfcraft_engine::Edit::EditPageImage { change: pdfcraft_engine::ImageEdit::Delete, .. }
+                | pdfcraft_engine::Edit::BakeBarcodeWhiteout { .. }
+        ) {
+            view.session.image_selection = None;
+        }
         view.session.pending_edit = Some(hud_edit);
     }
 
@@ -2404,13 +2441,23 @@ pub fn document_area_at(app: &mut PdfCraftApp, index: usize, rect: Rect, ui: &mu
         let clicked_page = placed.page;
         let size = view.page_sizes.get(clicked_page).copied().unwrap_or_default();
         let xf = PageXform::of(&placed, view.view.rotation, size);
-        if tool == QuickTool::QrBarcode {
+        if tool == QuickTool::QrBarcode || view.session.barcode_hud.open {
             view.session.barcode_hud.page_codes.entry(clicked_page).or_insert_with(|| doc.scan_page_codes(clicked_page));
             if let Some(hit_idx) = view.session.barcode_hud.codes_for_page(clicked_page).and_then(|codes| {
                 codes.iter().position(|c| xf.user_rect(info, clicked_page, c.rect.map(|v| v as f32)).expand(6.0).contains(start.origin))
             }) {
                 view.session.barcode_hud.focus_page_code(clicked_page, hit_idx);
                 view.view.current = clicked_page;
+                if can_modify {
+                    view.session.image_selection = view
+                        .session
+                        .barcode_hud
+                        .active_code()
+                        .and_then(|c| crate::barcode_hud::whole_image_index(c, doc))
+                        .map(|img_idx| crate::edit_text_ui::ImageSelection::at(clicked_page, img_idx));
+                }
+            } else if tool != QuickTool::EditText {
+                view.session.image_selection = None;
             }
         } else if (view.session.vector_edit_mode || tool == QuickTool::EditText) && can_modify {
             let line_hit = cached_vector_lines(&mut view.session, doc, clicked_page)
@@ -2527,7 +2574,7 @@ pub fn document_area_at(app: &mut PdfCraftApp, index: usize, rect: Rect, ui: &mu
     let refused = view.session.objects.notice.take();
     let form_notice = view.session.forms.notice.take();
     let mut tool = app.quick_tool;
-    if tool != QuickTool::EditText {
+    if tool != QuickTool::EditText && tool != QuickTool::QrBarcode && !view.session.barcode_hud.open {
         view.session.image_selection = None;
         crate::content_ui::release_image_selection(&mut view.session, &added);
     }

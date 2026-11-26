@@ -14,6 +14,7 @@
 
 pub mod actions;
 pub mod autotag;
+pub mod barcode_bake;
 pub mod barcode_scan;
 mod bookmarks;
 pub mod build_info;
